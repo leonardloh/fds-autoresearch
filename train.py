@@ -32,7 +32,7 @@ def train():
         reg_alpha=0.235,
         reg_lambda=3.45,
         eval_metric="logloss",
-        random_state=42,
+        random_state=6,
         n_jobs=-1,
     )
 
