@@ -57,8 +57,8 @@ commit	f1	precision   recall	status	description
 
 Example:
 ```
-commit	f1	precision	recall	status	description
-c2d8f3a	0.000000	0.000000	0.000000	crash	OOM encoding high-cardinality merchant_id one-hot
+commit	f1	precision	recall	status	description  review
+c2d8f3a	0.000000	0.000000	0.000000	crash	OOM encoding high-cardinality merchant_id one-hot   potential data-leakage for features used: CASE_NO
 e5a1b7c	0.851234	0.812345	0.894567	keep	target-encoded merchant_id + frequency features
 f9c3d2e	0.839012	0.856789	0.821890	discard	oversampled fraud class with SMOTE - precision up but recall dropped
 ```
@@ -74,9 +74,10 @@ LOOP FOREVER:
 4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context).
 5. Read out the results: `grep "^f1:\|^precision:\|^recall:" run.log`
 6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in `results.tsv` (NOTE: do not commit results.tsv, leave it untracked by git).
-8. If F1 improved (higher), you "advance" the branch, keeping the git commit.
-9. If F1 is equal or worse, you `git reset` back to where you started.
+7. Spawn a review agent that reads REVIEW.md.
+7. Record the results and the agent review in `results.tsv` (NOTE: do not commit results.tsv, leave it untracked by git).
+8. If F1 improved (higher) and pass the review agent, you "advance" the branch, keeping the git commit.
+9. If F1 is equal or worse or you're told that you have data leakage in your feature, you `git reset` back to where you started and fix the code.
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
 
