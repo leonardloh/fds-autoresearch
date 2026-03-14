@@ -11,17 +11,17 @@ def train():
 
     X_train, X_test, y_train, y_test, feature_cols = prepare()
 
-    # Class weight -- use 1.0 (no upweighting) to favor precision over recall
-    scale_pos_weight = 1.0
-
     model = xgb.XGBClassifier(
-        n_estimators=300,
-        max_depth=4,
-        learning_rate=0.1,
+        n_estimators=400,
+        max_depth=2,
+        learning_rate=0.2,
         min_child_weight=5,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        scale_pos_weight=scale_pos_weight,
+        subsample=1.0,
+        colsample_bytree=0.5,
+        scale_pos_weight=0.7,
+        gamma=0.3,
+        reg_alpha=0.01,
+        reg_lambda=2.0,
         eval_metric="logloss",
         random_state=42,
         n_jobs=-1,
@@ -31,7 +31,8 @@ def train():
     model.fit(X_train, y_train)
     training_seconds = time.time() - train_start
 
-    # Threshold tuning: train once per CV fold, sweep thresholds on predictions
+    # Threshold tuning via CV with minimum threshold of 0.08
+    # to prevent over-predicting in low-fraud periods
     best_thresh = 0.5
     if y_train.sum() >= 5:
         tscv = TimeSeriesSplit(n_splits=3)
@@ -41,9 +42,9 @@ def train():
             if y_train[tr_idx].sum() == 0:
                 continue
             m = xgb.XGBClassifier(
-                n_estimators=300, max_depth=4, learning_rate=0.1,
-                min_child_weight=5, subsample=0.8, colsample_bytree=0.8,
-                scale_pos_weight=1.0,
+                n_estimators=400, max_depth=2, learning_rate=0.2,
+                min_child_weight=5, subsample=1.0, colsample_bytree=0.5,
+                scale_pos_weight=0.7, gamma=0.3, reg_alpha=0.01, reg_lambda=2.0,
                 eval_metric="logloss", random_state=42, n_jobs=-1,
             )
             m.fit(X_train[tr_idx], y_train[tr_idx])
@@ -54,7 +55,7 @@ def train():
             all_probas = np.concatenate(fold_probas)
             all_labels = np.concatenate(fold_labels)
             best_cv_f1 = 0
-            for t in np.arange(0.05, 0.95, 0.01):
+            for t in np.arange(0.08, 0.95, 0.01):
                 score = f1_score(all_labels, (all_probas >= t).astype(int), zero_division=0)
                 if score > best_cv_f1:
                     best_cv_f1 = score
