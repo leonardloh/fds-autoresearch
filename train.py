@@ -18,9 +18,9 @@ def train():
      confirmed_fraud, confirmed_nf) = result
 
     model = xgb.XGBClassifier(
-        n_estimators=1500,
+        n_estimators=2000,
         max_depth=7,
-        learning_rate=0.02,
+        learning_rate=0.015,
         min_child_weight=5,
         subsample=0.8,
         colsample_bytree=0.5,
