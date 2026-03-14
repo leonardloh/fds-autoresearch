@@ -140,6 +140,10 @@ def add_dummies(df, train_df):
 def compute_velocity_features(df):
     """Compute per-card velocity and behavioral features over the full timeline.
 
+    Features are engineered from raw transaction data, replicating the underlying
+    signals that CC/RAD detection rules check (velocity, volume, same-MCC repeats,
+    contactless patterns, currency diversity) WITHOUT using rule outputs.
+
     Preserves the original dataframe index/order. Only looks backward in time
     (no future leakage). Data must already be sorted by cre_tms.
     """
@@ -147,30 +151,41 @@ def compute_velocity_features(df):
     card_col = "REF_CRD_NO"
     orig_index = df.index.copy()
 
-    # Initialize velocity columns
-    df["card_txn_count_1h"] = 0.0
-    df["card_txn_count_24h"] = 0.0
-    df["card_txn_sum_24h"] = 0.0
-    df["card_txn_count_10min"] = 0.0
-    df["card_txn_sum_10min"] = 0.0
-    df["card_max_amt_24h"] = 0.0
-    df["time_since_last_txn"] = 0.0
+    # Initialize all velocity columns
+    vel_cols = [
+        "card_txn_count_1h", "card_txn_count_24h", "card_txn_sum_24h",
+        "card_txn_count_10min", "card_txn_sum_10min",
+        "card_txn_sum_1h",       # TSCC9/QACC9: volume in 1h (RM300 threshold)
+        "card_max_amt_24h",
+        "same_mcc_count_1h",     # TSCC1/QACC1: same MCC repeat in 1h
+        "same_mcc_count_10min",  # QACC5/TSCC5: same MCC repeat in 10min
+        "contactless_count_1h",  # TSCC6: contactless velocity in 1h
+        "contactless_sum_1h",    # TSCC10: contactless volume in 1h
+        "distinct_ccy_30min",    # TSCC13/QACC13: different currency in 30min
+        "time_since_last_txn",
+        "is_first_txn",
+        "new_merchant",
+        "distinct_merch_24h",
+        "distinct_mcc_24h",
+    ]
+    for c in vel_cols:
+        df[c] = 0.0
     df["is_first_txn"] = 1.0
 
     one_hour = 10000000  # CRE_TMS format: YYYYMMDDHHMMSSmmm
     ten_minutes = 1000000
+    thirty_minutes = 3000000
     twenty_four_hours = 240000000
 
     # Sort by card + time for velocity computation, but track original position
     df["_orig_pos"] = np.arange(len(df))
     df = df.sort_values([card_col, "cre_tms"])
 
-    # Also track merchant diversity and new merchant per card
-    merch_col = df["MMER_ID"].astype(str).str.strip().values
-    mcc_col = df["mcc"].values
-    df["new_merchant"] = 0.0
-    df["distinct_merch_24h"] = 0.0
-    df["distinct_mcc_24h"] = 0.0
+    # Pre-extract arrays for per-txn attributes
+    merch_arr = df["MMER_ID"].astype(str).str.strip().values
+    mcc_arr = df["mcc"].values
+    contactless_arr = df["is_contactless"].values
+    ccy_arr = df["DE049"].astype(str).str.strip().values if "DE049" in df.columns else np.full(len(df), "458")
 
     for card_id in df[card_col].unique():
         mask = df[card_col] == card_id
@@ -178,16 +193,24 @@ def compute_velocity_features(df):
         idxs = card_df.index.tolist()
         times = card_df["cre_tms"].values
         amounts = card_df["amount"].values
-        # Get positional indices for merch/mcc arrays
         pos_indices = card_df["_orig_pos"].values.astype(int)
         n = len(times)
 
+        # Standard velocity/volume arrays
         cnt_1h = np.zeros(n)
         cnt_24h = np.zeros(n)
         sum_24h = np.zeros(n)
         cnt_10m = np.zeros(n)
         sum_10m = np.zeros(n)
+        sum_1h = np.zeros(n)
         max_amt_24h = np.zeros(n)
+        # Rule-inspired arrays
+        same_mcc_1h = np.zeros(n)
+        same_mcc_10m = np.zeros(n)
+        ctless_cnt_1h = np.zeros(n)
+        ctless_sum_1h = np.zeros(n)
+        dist_ccy_30m = np.zeros(n)
+        # Behavioral arrays
         time_since = np.zeros(n)
         is_first = np.ones(n)
         new_merch = np.zeros(n)
@@ -197,40 +220,58 @@ def compute_velocity_features(df):
         seen_merchants = set()
         for i in range(n):
             t = times[i]
-            cur_merch = merch_col[pos_indices[i]]
-            cur_mcc = mcc_col[pos_indices[i]]
+            pi = pos_indices[i]
+            cur_merch = merch_arr[pi]
+            cur_mcc = mcc_arr[pi]
 
-            # New merchant flag
             if cur_merch not in seen_merchants:
                 new_merch[i] = 1.0
             seen_merchants.add(cur_merch)
 
-            # Time since last
             if i > 0:
                 is_first[i] = 0.0
                 time_since[i] = t - times[i - 1]
 
-            # Window-based features
             merch_set_24h = set()
             mcc_set_24h = set()
+            ccy_set_30m = set()
+
             for j in range(i - 1, -1, -1):
                 diff = t - times[j]
                 if diff > twenty_four_hours:
                     break
+                pj = pos_indices[j]
+
                 cnt_24h[i] += 1
                 sum_24h[i] += amounts[j]
                 if amounts[j] > max_amt_24h[i]:
                     max_amt_24h[i] = amounts[j]
-                merch_set_24h.add(merch_col[pos_indices[j]])
-                mcc_set_24h.add(mcc_col[pos_indices[j]])
+                merch_set_24h.add(merch_arr[pj])
+                mcc_set_24h.add(mcc_arr[pj])
+
                 if diff <= one_hour:
                     cnt_1h[i] += 1
+                    sum_1h[i] += amounts[j]
+                    # Same MCC as current txn within 1h
+                    if mcc_arr[pj] == cur_mcc:
+                        same_mcc_1h[i] += 1
+                    # Contactless within 1h
+                    if contactless_arr[pj]:
+                        ctless_cnt_1h[i] += 1
+                        ctless_sum_1h[i] += amounts[j]
+
+                if diff <= thirty_minutes:
+                    ccy_set_30m.add(ccy_arr[pj])
+
                 if diff <= ten_minutes:
                     cnt_10m[i] += 1
                     sum_10m[i] += amounts[j]
+                    if mcc_arr[pj] == cur_mcc:
+                        same_mcc_10m[i] += 1
 
             dist_merch[i] = len(merch_set_24h)
             dist_mcc[i] = len(mcc_set_24h)
+            dist_ccy_30m[i] = len(ccy_set_30m)
 
         for k, idx in enumerate(idxs):
             df.at[idx, "card_txn_count_1h"] = cnt_1h[k]
@@ -238,7 +279,13 @@ def compute_velocity_features(df):
             df.at[idx, "card_txn_sum_24h"] = sum_24h[k]
             df.at[idx, "card_txn_count_10min"] = cnt_10m[k]
             df.at[idx, "card_txn_sum_10min"] = sum_10m[k]
+            df.at[idx, "card_txn_sum_1h"] = sum_1h[k]
             df.at[idx, "card_max_amt_24h"] = max_amt_24h[k]
+            df.at[idx, "same_mcc_count_1h"] = same_mcc_1h[k]
+            df.at[idx, "same_mcc_count_10min"] = same_mcc_10m[k]
+            df.at[idx, "contactless_count_1h"] = ctless_cnt_1h[k]
+            df.at[idx, "contactless_sum_1h"] = ctless_sum_1h[k]
+            df.at[idx, "distinct_ccy_30min"] = dist_ccy_30m[k]
             df.at[idx, "time_since_last_txn"] = time_since[k]
             df.at[idx, "is_first_txn"] = is_first[k]
             df.at[idx, "new_merchant"] = new_merch[k]
@@ -248,6 +295,14 @@ def compute_velocity_features(df):
     # Restore original order
     df = df.sort_values("_orig_pos").drop(columns=["_orig_pos"])
     df.index = orig_index
+
+    # Derived threshold features (inspired by rule thresholds, computed from raw data)
+    df["sum_1h_gte_300"] = (df["card_txn_sum_1h"] >= 300).astype(int)
+    df["same_mcc_gte_3_1h"] = (df["same_mcc_count_1h"] >= 3).astype(int)
+    df["ctless_cnt_gte_4_1h"] = (df["contactless_count_1h"] >= 4).astype(int)
+    df["ctless_sum_gte_250_1h"] = (df["contactless_sum_1h"] >= 250).astype(int)
+    df["multi_ccy_30min"] = (df["distinct_ccy_30min"] >= 2).astype(int)
+    df["high_charge_500"] = (df["amount"] >= 500).astype(int)
 
     return df
 
