@@ -73,17 +73,15 @@ def train():
     print("---")
     print()
 
-    # === Prioritization: score ALL flagged transactions across train+test ===
-    # Use model to score all data, then evaluate ranking on confirmed cases
+    # === Prioritization: score ALL originally-flagged transactions ===
+    # Use case_no > 0 (original flag), NOT the cleaned label
     y_proba_train = model.predict_proba(X_train)[:, 1]
 
-    # Combine train+test scores and case numbers
     all_probas = np.concatenate([y_proba_train, y_proba_test])
     all_case_nos = np.concatenate([train_case_nos, test_case_nos])
-    all_labels = np.concatenate([y_train, y_test])
 
-    # Among flagged transactions, build case-level max risk score
-    flagged_mask = all_labels == 1
+    # Flagged = originally had a case (case_no > 0), regardless of label cleanup
+    flagged_mask = all_case_nos > 0
     flagged_probas = all_probas[flagged_mask]
     flagged_case_nos = all_case_nos[flagged_mask]
 
