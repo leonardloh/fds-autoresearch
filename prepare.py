@@ -42,6 +42,24 @@ def create_label(iso, cases, cuh):
     return iso
 
 
+def _parse_cre_tms_to_seconds(cre_tms_series):
+    """Convert CRE_TMS (YYYYMMDDHHMMSSmmm) to epoch seconds.
+
+    FIX #4: The old code treated CRE_TMS as a plain integer and used
+    arithmetic gaps like 10000000 for '1 hour'. That breaks across
+    day/month/year boundaries because the DD/MM fields are not base-10
+    subdivisions of time. We now parse to proper datetime.
+    """
+    s = cre_tms_series.astype(str).str.strip().str.zfill(17)
+    dt = pd.to_datetime(
+        s.str[:14],  # YYYYMMDDHHMMSSs
+        format="%Y%m%d%H%M%S",
+        errors="coerce",
+    )
+    # Convert to float seconds since epoch for fast arithmetic
+    return (dt - pd.Timestamp("1970-01-01")).dt.total_seconds().fillna(0).values
+
+
 def engineer_features(df):
     """Engineer features from raw transaction attributes.
 
@@ -54,25 +72,22 @@ def engineer_features(df):
     # === Amount features ===
     df["amount"] = df["DE004"].fillna(0).astype(float)
     df["log_amount"] = np.log1p(df["amount"])
-    # Amount threshold features (inspired by RAD rules checking amount thresholds)
     df["amount_gte_1000"] = (df["amount"] >= 1000).astype(int)
     df["amount_gte_5000"] = (df["amount"] >= 5000).astype(int)
     df["amount_gte_250"] = (df["amount"] >= 250).astype(int)
 
     # === MCC ===
     df["mcc"] = df["DE018"].fillna(0).astype(int)
-    # High-risk MCC flags (inspired by RAD rules targeting specific MCCs)
-    df["mcc_6011"] = (df["mcc"] == 6011).astype(int)  # ATM/cash
-    df["mcc_5411"] = (df["mcc"] == 5411).astype(int)  # grocery/supermarket
-    df["mcc_5999"] = (df["mcc"] == 5999).astype(int)  # misc retail
+    df["mcc_6011"] = (df["mcc"] == 6011).astype(int)
+    df["mcc_5411"] = (df["mcc"] == 5411).astype(int)
+    df["mcc_5999"] = (df["mcc"] == 5999).astype(int)
 
-    # === Card-present flags (pre-authorization attributes) ===
+    # === Card-present flags ===
     df["is_emv"] = (df["EMV_STAT"].astype(str).str.strip() == "Y").astype(int)
     df["is_contactless"] = (df["EMV_STAT"].astype(str).str.strip() == "C").astype(int)
     df["is_chip"] = (df["CHIP_STAT"].astype(str).str.strip() == "Y").astype(int)
     df["is_fallback"] = (df["FALLBCK_FLG"].astype(str).str.strip() == "Y").astype(int)
     df["is_ecom"] = (df["ECOM_3D_FLG"].astype(str).str.strip() == "Y").astype(int)
-    # Magstripe detection (inspired by TSRAD13: magstripe transaction rule)
     pos_entry = df["DE022"].astype(str).str.strip()
     df["is_magstripe"] = pos_entry.isin(["90", "02"]).astype(int)
 
@@ -97,7 +112,6 @@ def engineer_features(df):
     df["eci_nonsecure"] = (eci_str == "008").astype(int)
     df["eci_recurring"] = (eci_str == "002").astype(int)
     df["eci_moto"] = eci_str.isin(["001", "004"]).astype(int)
-    # Non-3DS flag (inspired by RAD rules: XYZRAD1A, XYZRAD1B, RAD01)
     df["is_non_3ds"] = ((df["eci_authenticated"] == 0) & (df["is_ecom"] == 0)).astype(int)
 
     # === Payment network ===
@@ -109,8 +123,8 @@ def engineer_features(df):
     df["is_non_fiat"] = (df["NON_FIAT_IND"].astype(str).str.strip() == "Y").astype(int)
     df["is_daf"] = (df["DAF_IND"].astype(str).str.strip() == "Y").astype(int)
 
-    # === Timestamp for temporal operations ===
-    df["cre_tms"] = pd.to_numeric(df["CRE_TMS"], errors="coerce").fillna(0)
+    # === Timestamp: proper epoch seconds (FIX #4) ===
+    df["cre_tms"] = _parse_cre_tms_to_seconds(df["CRE_TMS"])
 
     # === Categorical string columns (for dummies after split) ===
     df["trx_typ"] = df["TRX_TYP"].astype(str).str.strip()
@@ -125,43 +139,31 @@ def add_dummies(df, train_df):
     """Create dummy variables fitted on training data, then aligned to df."""
     df = df.copy()
     for col, prefix in [("trx_typ", "trx"), ("pos_entry", "pos"), ("de003_txn_type", "d3txn")]:
-        # Get categories from training data only
         train_dummies = pd.get_dummies(train_df[col], prefix=prefix)
         dummy_cols = train_dummies.columns.tolist()
-
-        # Create dummies for df and align to training categories
         df_dummies = pd.get_dummies(df[col], prefix=prefix)
         df_dummies = df_dummies.reindex(columns=dummy_cols, fill_value=0)
         df = pd.concat([df, df_dummies], axis=1)
-
     return df
 
 
 def compute_velocity_features(df):
     """Compute per-card velocity and behavioral features over the full timeline.
 
-    Features are engineered from raw transaction data, replicating the underlying
-    signals that CC/RAD detection rules check (velocity, volume, same-MCC repeats,
-    contactless patterns, currency diversity) WITHOUT using rule outputs.
-
-    Preserves the original dataframe index/order. Only looks backward in time
-    (no future leakage). Data must already be sorted by cre_tms.
+    FIX #4: Time windows now use proper seconds (not broken integer arithmetic).
     """
     df = df.copy()
     card_col = "REF_CRD_NO"
     orig_index = df.index.copy()
 
-    # Initialize all velocity columns
     vel_cols = [
         "card_txn_count_1h", "card_txn_count_24h", "card_txn_sum_24h",
         "card_txn_count_10min", "card_txn_sum_10min",
-        "card_txn_sum_1h",       # TSCC9/QACC9: volume in 1h (RM300 threshold)
+        "card_txn_sum_1h",
         "card_max_amt_24h",
-        "same_mcc_count_1h",     # TSCC1/QACC1: same MCC repeat in 1h
-        "same_mcc_count_10min",  # QACC5/TSCC5: same MCC repeat in 10min
-        "contactless_count_1h",  # TSCC6: contactless velocity in 1h
-        "contactless_sum_1h",    # TSCC10: contactless volume in 1h
-        "distinct_ccy_30min",    # TSCC13/QACC13: different currency in 30min
+        "same_mcc_count_1h", "same_mcc_count_10min",
+        "contactless_count_1h", "contactless_sum_1h",
+        "distinct_ccy_30min",
         "time_since_last_txn",
         "is_first_txn",
         "new_merchant",
@@ -172,16 +174,15 @@ def compute_velocity_features(df):
         df[c] = 0.0
     df["is_first_txn"] = 1.0
 
-    one_hour = 10000000  # CRE_TMS format: YYYYMMDDHHMMSSmmm
-    ten_minutes = 1000000
-    thirty_minutes = 3000000
-    twenty_four_hours = 240000000
+    # Proper time windows in seconds (FIX #4)
+    one_hour = 3600.0
+    ten_minutes = 600.0
+    thirty_minutes = 1800.0
+    twenty_four_hours = 86400.0
 
-    # Sort by card + time for velocity computation, but track original position
     df["_orig_pos"] = np.arange(len(df))
     df = df.sort_values([card_col, "cre_tms"])
 
-    # Pre-extract arrays for per-txn attributes
     merch_arr = df["MMER_ID"].astype(str).str.strip().values
     mcc_arr = df["mcc"].values
     contactless_arr = df["is_contactless"].values
@@ -196,7 +197,6 @@ def compute_velocity_features(df):
         pos_indices = card_df["_orig_pos"].values.astype(int)
         n = len(times)
 
-        # Standard velocity/volume arrays
         cnt_1h = np.zeros(n)
         cnt_24h = np.zeros(n)
         sum_24h = np.zeros(n)
@@ -204,13 +204,11 @@ def compute_velocity_features(df):
         sum_10m = np.zeros(n)
         sum_1h = np.zeros(n)
         max_amt_24h = np.zeros(n)
-        # Rule-inspired arrays
         same_mcc_1h = np.zeros(n)
         same_mcc_10m = np.zeros(n)
         ctless_cnt_1h = np.zeros(n)
         ctless_sum_1h = np.zeros(n)
         dist_ccy_30m = np.zeros(n)
-        # Behavioral arrays
         time_since = np.zeros(n)
         is_first = np.ones(n)
         new_merch = np.zeros(n)
@@ -252,10 +250,8 @@ def compute_velocity_features(df):
                 if diff <= one_hour:
                     cnt_1h[i] += 1
                     sum_1h[i] += amounts[j]
-                    # Same MCC as current txn within 1h
                     if mcc_arr[pj] == cur_mcc:
                         same_mcc_1h[i] += 1
-                    # Contactless within 1h
                     if contactless_arr[pj]:
                         ctless_cnt_1h[i] += 1
                         ctless_sum_1h[i] += amounts[j]
@@ -292,11 +288,9 @@ def compute_velocity_features(df):
             df.at[idx, "distinct_merch_24h"] = dist_merch[k]
             df.at[idx, "distinct_mcc_24h"] = dist_mcc[k]
 
-    # Restore original order
     df = df.sort_values("_orig_pos").drop(columns=["_orig_pos"])
     df.index = orig_index
 
-    # Derived threshold features (inspired by rule thresholds, computed from raw data)
     df["sum_1h_gte_300"] = (df["card_txn_sum_1h"] >= 300).astype(int)
     df["same_mcc_gte_3_1h"] = (df["same_mcc_count_1h"] >= 3).astype(int)
     df["ctless_cnt_gte_4_1h"] = (df["contactless_count_1h"] >= 4).astype(int)
@@ -307,12 +301,16 @@ def compute_velocity_features(df):
     return df
 
 
-def compute_aggregation_features(df, train_df):
-    """Compute card/merchant/MCC aggregation + target encoding from train only."""
+def compute_aggregation_features(df, train_df, is_train=False):
+    """Compute card/merchant/MCC aggregation + target encoding.
+
+    FIX #2: Target encoding now uses leave-one-out for training rows
+    so each row does not see its own label in the encoded value.
+    """
     df = df.copy()
     card_col = "REF_CRD_NO"
 
-    # Card-level stats
+    # Card-level stats (amount-based, no label leakage)
     card_stats = train_df.groupby(card_col)["amount"].agg(
         card_txn_count="count", card_txn_mean="mean",
         card_txn_std="std", card_txn_max="max",
@@ -324,7 +322,7 @@ def compute_aggregation_features(df, train_df):
     df["amount_vs_card_max"] = df["amount"] / (df["card_txn_max"] + 1)
     df["amount_zscore"] = (df["amount"] - df["card_txn_mean"]) / (df["card_txn_std"] + 1e-8)
 
-    # Merchant-level stats
+    # Merchant-level stats (amount-based)
     m_col = "_merch_str"
     df[m_col] = df["MMER_ID"].astype(str).str.strip()
     train_m = train_df.copy()
@@ -337,7 +335,7 @@ def compute_aggregation_features(df, train_df):
         df[c] = df[c].fillna(0)
     df.drop(columns=[m_col], inplace=True)
 
-    # MCC-level stats
+    # MCC-level stats (amount-based)
     mcc_stats = train_df.groupby("mcc")["amount"].agg(
         mcc_txn_count="count", mcc_txn_mean="mean",
     ).fillna(0)
@@ -345,33 +343,93 @@ def compute_aggregation_features(df, train_df):
     for c in ["mcc_txn_count", "mcc_txn_mean"]:
         df[c] = df[c].fillna(0)
 
-    # === Target-encoded risk (smoothed, train-only) ===
+    # === Target-encoded risk (FIX #2: leave-one-out for training) ===
     global_mean = train_df["fraud"].mean()
     smoothing = 10
 
     for group_col, risk_name in [("mcc", "mcc_risk"), (card_col, "card_risk")]:
-        grp = train_df.groupby(group_col)["fraud"].agg(["mean", "count"])
-        grp[risk_name] = (
-            (grp["count"] * grp["mean"] + smoothing * global_mean)
-            / (grp["count"] + smoothing)
-        )
-        df = df.merge(grp[[risk_name]], left_on=group_col, right_index=True, how="left")
-        df[risk_name] = df[risk_name].fillna(global_mean)
+        grp = train_df.groupby(group_col)["fraud"].agg(["sum", "count"])
+        grp.columns = ["_grp_sum", "_grp_count"]
 
-    # Merchant risk
+        if is_train:
+            # Leave-one-out: subtract this row's label from the group stats
+            df = df.merge(grp, left_on=group_col, right_index=True, how="left")
+            df["_grp_sum"] = df["_grp_sum"].fillna(0)
+            df["_grp_count"] = df["_grp_count"].fillna(0)
+            loo_sum = df["_grp_sum"] - df["fraud"]
+            loo_count = df["_grp_count"] - 1
+            df[risk_name] = (
+                (loo_count * (loo_sum / (loo_count + 1e-8)) + smoothing * global_mean)
+                / (loo_count + smoothing)
+            )
+            df.loc[loo_count <= 0, risk_name] = global_mean
+            df.drop(columns=["_grp_sum", "_grp_count"], inplace=True)
+        else:
+            # Test: standard smoothed encoding from full training stats
+            grp[risk_name] = (
+                (grp["_grp_sum"] + smoothing * global_mean)
+                / (grp["_grp_count"] + smoothing)
+            )
+            df = df.merge(grp[[risk_name]], left_on=group_col, right_index=True, how="left")
+            df[risk_name] = df[risk_name].fillna(global_mean)
+
+    # Merchant risk (same LOO pattern)
     train_m2 = train_df.copy()
     train_m2["_m2"] = train_m2["MMER_ID"].astype(str).str.strip()
     df["_m2"] = df["MMER_ID"].astype(str).str.strip()
-    mf = train_m2.groupby("_m2")["fraud"].agg(["mean", "count"])
-    mf["merch_risk"] = (
-        (mf["count"] * mf["mean"] + smoothing * global_mean)
-        / (mf["count"] + smoothing)
-    )
-    df = df.merge(mf[["merch_risk"]], left_on="_m2", right_index=True, how="left")
-    df["merch_risk"] = df["merch_risk"].fillna(global_mean)
+    mf = train_m2.groupby("_m2")["fraud"].agg(["sum", "count"])
+    mf.columns = ["_grp_sum", "_grp_count"]
+
+    if is_train:
+        df = df.merge(mf, left_on="_m2", right_index=True, how="left")
+        df["_grp_sum"] = df["_grp_sum"].fillna(0)
+        df["_grp_count"] = df["_grp_count"].fillna(0)
+        loo_sum = df["_grp_sum"] - df["fraud"]
+        loo_count = df["_grp_count"] - 1
+        df["merch_risk"] = (
+            (loo_count * (loo_sum / (loo_count + 1e-8)) + smoothing * global_mean)
+            / (loo_count + smoothing)
+        )
+        df.loc[loo_count <= 0, "merch_risk"] = global_mean
+        df.drop(columns=["_grp_sum", "_grp_count"], inplace=True)
+    else:
+        mf["merch_risk"] = (
+            (mf["_grp_sum"] + smoothing * global_mean)
+            / (mf["_grp_count"] + smoothing)
+        )
+        df = df.merge(mf[["merch_risk"]], left_on="_m2", right_index=True, how="left")
+        df["merch_risk"] = df["merch_risk"].fillna(global_mean)
     df.drop(columns=["_m2"], inplace=True)
 
-    # === Amount deviation from MCC norm (from training data) ===
+    # POS entry risk (LOO for train)
+    pos_risk_data = train_df.copy()
+    pos_risk_data["_pos"] = pos_risk_data["DE022"].astype(str).str.strip()
+    df["_pos"] = df["DE022"].astype(str).str.strip()
+    pf = pos_risk_data.groupby("_pos")["fraud"].agg(["sum", "count"])
+    pf.columns = ["_grp_sum", "_grp_count"]
+
+    if is_train:
+        df = df.merge(pf, left_on="_pos", right_index=True, how="left")
+        df["_grp_sum"] = df["_grp_sum"].fillna(0)
+        df["_grp_count"] = df["_grp_count"].fillna(0)
+        loo_sum = df["_grp_sum"] - df["fraud"]
+        loo_count = df["_grp_count"] - 1
+        df["pos_risk"] = (
+            (loo_count * (loo_sum / (loo_count + 1e-8)) + smoothing * global_mean)
+            / (loo_count + smoothing)
+        )
+        df.loc[loo_count <= 0, "pos_risk"] = global_mean
+        df.drop(columns=["_grp_sum", "_grp_count"], inplace=True)
+    else:
+        pf["pos_risk"] = (
+            (pf["_grp_sum"] + smoothing * global_mean)
+            / (pf["_grp_count"] + smoothing)
+        )
+        df = df.merge(pf[["pos_risk"]], left_on="_pos", right_index=True, how="left")
+        df["pos_risk"] = df["pos_risk"].fillna(global_mean)
+    df.drop(columns=["_pos"], errors="ignore", inplace=True)
+
+    # === Amount deviation from MCC norm (amount-based, no label leakage) ===
     mcc_amount_stats = train_df.groupby("mcc")["amount"].agg(
         mcc_amount_mean="mean", mcc_amount_std="std",
         mcc_amount_median="median",
@@ -383,22 +441,7 @@ def compute_aggregation_features(df, train_df):
     df["amount_mcc_zscore"] = (df["amount"] - df["mcc_amount_mean"]) / (df["mcc_amount_std"] + 1e-8)
     df["amount_vs_mcc_median"] = df["amount"] / (df["mcc_amount_median"] + 1)
 
-    # === Card amount variability features ===
-    df["card_amount_cv"] = df["card_txn_std"] / (df["card_txn_mean"] + 1e-8)  # coefficient of variation
-
-    # === POS entry risk (from training data) ===
-    pos_risk_data = train_df.copy()
-    pos_risk_data["_pos"] = pos_risk_data["DE022"].astype(str).str.strip() if "DE022" in pos_risk_data.columns else ""
-    df["_pos"] = df["DE022"].astype(str).str.strip() if "DE022" in df.columns else ""
-    if "_pos" in pos_risk_data.columns:
-        pos_fraud = pos_risk_data.groupby("_pos")["fraud"].agg(["mean", "count"])
-        pos_fraud["pos_risk"] = (
-            (pos_fraud["count"] * pos_fraud["mean"] + smoothing * global_mean)
-            / (pos_fraud["count"] + smoothing)
-        )
-        df = df.merge(pos_fraud[["pos_risk"]], left_on="_pos", right_index=True, how="left")
-        df["pos_risk"] = df["pos_risk"].fillna(global_mean)
-    df.drop(columns=["_pos"], errors="ignore", inplace=True)
+    df["card_amount_cv"] = df["card_txn_std"] / (df["card_txn_mean"] + 1e-8)
 
     # Interaction features
     df["amount_x_foreign"] = df["amount"] * df["is_foreign_currency"]
@@ -436,24 +479,20 @@ def prepare():
     iso = create_label(iso, cases, cuh)
     df = engineer_features(iso)
 
-    # Time-based split
     df = df.sort_values("cre_tms").reset_index(drop=True)
     split_idx = int(len(df) * 0.8)
 
-    # Compute velocity on full timeline (so test sees training history)
-    # df is already sorted by cre_tms; velocity preserves this order
     df = compute_velocity_features(df)
 
     train_df = df.iloc[:split_idx].copy()
     test_df = df.iloc[split_idx:].copy()
 
-    # Dummies fitted on training data only
     train_df = add_dummies(train_df, train_df)
     test_df = add_dummies(test_df, train_df)
 
-    # Aggregation + target encoding from training data only
-    train_df = compute_aggregation_features(train_df, train_df)
-    test_df = compute_aggregation_features(test_df, train_df)
+    # FIX #2: LOO target encoding for train, standard for test
+    train_df = compute_aggregation_features(train_df, train_df, is_train=True)
+    test_df = compute_aggregation_features(test_df, train_df, is_train=False)
 
     feature_cols = get_feature_columns(train_df)
 
@@ -471,7 +510,6 @@ def prepare_prioritization():
     iso = create_label(iso, cases, cuh)
     df = engineer_features(iso)
 
-    # Time-based split
     df = df.sort_values("cre_tms").reset_index(drop=True)
     split_idx = int(len(df) * 0.8)
 
@@ -483,8 +521,9 @@ def prepare_prioritization():
     train_df = add_dummies(train_df, train_df)
     test_df = add_dummies(test_df, train_df)
 
-    train_df = compute_aggregation_features(train_df, train_df)
-    test_df = compute_aggregation_features(test_df, train_df)
+    # FIX #2: LOO target encoding for train, standard for test
+    train_df = compute_aggregation_features(train_df, train_df, is_train=True)
+    test_df = compute_aggregation_features(test_df, train_df, is_train=False)
 
     feature_cols = get_feature_columns(train_df)
 
@@ -494,9 +533,6 @@ def prepare_prioritization():
     y_test = test_df["fraud"].values
 
     # Case-level info for prioritization eval
-    train_case_nos = pd.to_numeric(
-        train_df["CASE_NO"].astype(str).str.strip(), errors="coerce"
-    ).fillna(0).astype(int).values
     test_case_nos = pd.to_numeric(
         test_df["CASE_NO"].astype(str).str.strip(), errors="coerce"
     ).fillna(0).astype(int).values
@@ -510,7 +546,7 @@ def prepare_prioritization():
         last_per_case[last_per_case["CASE_STATUS"] == 750].index.values)
 
     return (X_train, X_test, y_train, y_test, feature_cols,
-            train_case_nos, test_case_nos, confirmed_fraud, confirmed_nf)
+            test_case_nos, confirmed_fraud, confirmed_nf)
 
 
 if __name__ == "__main__":
