@@ -19,7 +19,7 @@ def train():
 
     model = xgb.XGBClassifier(
         n_estimators=2000,
-        max_depth=7,
+        max_depth=8,
         learning_rate=0.015,
         min_child_weight=5,
         subsample=0.8,
