@@ -10,36 +10,22 @@ def load_data():
 
 
 def create_label(iso, cases):
-    """Label based on confirmed fraud cases.
+    """Label: fraud=1 if transaction has a valid CASE_NO (flagged for investigation).
 
-    - fraud=1: transaction belongs to a confirmed fraud case
-      (CASE_STATUS=700 with non-blank F_TYPE_CODE in Case_Creation_Details)
-    - fraud=0: transaction with no case (never flagged)
-    - EXCLUDED: transactions with cases that were NOT confirmed fraud
-      (ambiguous - could be false alarms or pending investigation)
+    While not all flagged transactions are confirmed fraud, the case creation
+    process reflects genuine suspicion from the rule-based system. With only
+    33 confirmed fraud cases (70 txns), using confirmed-only labels would be
+    too few for meaningful modeling. Using all cased transactions (4415 txns)
+    as positive class is a pragmatic choice.
+
+    The model's goal: learn transaction characteristics that predict flagging,
+    WITHOUT using the hit-rules features that directly cause the flagging.
     """
-    # Identify confirmed fraud case numbers
-    confirmed = cases[
-        (cases["CASE_STATUS"] == 700)
-        & (cases["F_TYPE_CODE"].astype(str).str.strip() != "")
-    ]
-    confirmed_case_nos = set(confirmed["CASE_NO"].astype(int))
-
     iso = iso.copy()
     case_no_int = pd.to_numeric(
         iso["CASE_NO"].astype(str).str.strip(), errors="coerce"
     ).fillna(0).astype(int)
-
-    iso["_case_no_int"] = case_no_int
-    iso["fraud"] = case_no_int.isin(confirmed_case_nos).astype(int)
-
-    # Exclude ambiguous transactions (cased but not confirmed fraud)
-    has_case = case_no_int > 0
-    is_confirmed = iso["fraud"] == 1
-    ambiguous = has_case & ~is_confirmed
-    iso = iso[~ambiguous].reset_index(drop=True)
-    iso.drop(columns=["_case_no_int"], inplace=True)
-
+    iso["fraud"] = (case_no_int > 0).astype(int)
     return iso
 
 
