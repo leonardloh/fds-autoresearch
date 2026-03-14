@@ -6,83 +6,55 @@ from sklearn.model_selection import train_test_split
 def load_data():
     iso = pd.read_excel("Dataset/ISO8583_Transaction_Records.xlsx")
     cases = pd.read_excel("Dataset/Case_Creation_Details.xlsx")
-    hit_rules = pd.read_excel("Dataset/Transaction_Hit_Rules.xlsx")
-    return iso, cases, hit_rules
+    return iso, cases
 
 
-def create_label(iso):
-    """Label: 1 if transaction has a valid CASE_NO (flagged for fraud), 0 otherwise."""
-    case_no_int = pd.to_numeric(iso["CASE_NO"].astype(str).str.strip(), errors="coerce")
-    iso = iso.copy()
-    iso["fraud"] = (case_no_int > 0).astype(int)
-    return iso
+def create_label(iso, cases):
+    """Label based on confirmed fraud cases.
 
-
-def add_hit_rules_features(iso, hit_rules):
-    """Aggregate transaction hit rules per DE037 (reference number).
-
-    NOTE: Transaction_Hit_Rules records which rules fired for each transaction.
-    This data IS available at decision time since rules fire during authorization.
-    RAD rules fire pre-authorization, CC rules fire post-authorization.
-    We use only the count/type of rules triggered, not the case outcome.
+    - fraud=1: transaction belongs to a confirmed fraud case
+      (CASE_STATUS=700 with non-blank F_TYPE_CODE in Case_Creation_Details)
+    - fraud=0: transaction with no case (never flagged)
+    - EXCLUDED: transactions with cases that were NOT confirmed fraud
+      (ambiguous - could be false alarms or pending investigation)
     """
-    hr = hit_rules.copy()
-    hr["DE037"] = hr["DE037"].astype(str).str.strip()
-    hr["TOT_SCR"] = pd.to_numeric(hr["TOT_SCR"].astype(str).str.strip(), errors="coerce").fillna(0)
-    hr["RULE_TYP_str"] = hr["RULE_TYP"].astype(str).str.strip()
-
-    # Aggregate per transaction reference
-    hr_agg = hr.groupby("DE037").agg(
-        rules_hit_count=("RULE_ID", "count"),
-        rules_tot_score=("TOT_SCR", "max"),
-        rules_unique_count=("RULE_ID", "nunique"),
-    ).reset_index()
-
-    # RAD vs CC rule counts
-    hr_rad = hr[hr["RULE_TYP_str"] == "RAD"].groupby("DE037").size().reset_index(name="rad_rule_count")
-    hr_cc = hr[hr["RULE_TYP_str"] == "CC"].groupby("DE037").size().reset_index(name="cc_rule_count")
-
-    # Top rule indicators
-    top_rules = ["N001", "TA003", "NOT1", "NOT2", "TA004", "000LJW", "C8"]
-    for rule_id in top_rules:
-        hr_rule = (
-            hr[hr["RULE_ID"].astype(str).str.strip() == rule_id]
-            .groupby("DE037").size().reset_index(name=f"rule_{rule_id}")
-        )
-        hr_agg = hr_agg.merge(hr_rule, on="DE037", how="left")
-        hr_agg[f"rule_{rule_id}"] = hr_agg[f"rule_{rule_id}"].fillna(0)
-
-    hr_agg = hr_agg.merge(hr_rad, on="DE037", how="left")
-    hr_agg = hr_agg.merge(hr_cc, on="DE037", how="left")
-    hr_agg["rad_rule_count"] = hr_agg["rad_rule_count"].fillna(0)
-    hr_agg["cc_rule_count"] = hr_agg["cc_rule_count"].fillna(0)
+    # Identify confirmed fraud case numbers
+    confirmed = cases[
+        (cases["CASE_STATUS"] == 700)
+        & (cases["F_TYPE_CODE"].astype(str).str.strip() != "")
+    ]
+    confirmed_case_nos = set(confirmed["CASE_NO"].astype(int))
 
     iso = iso.copy()
-    iso["DE037_str"] = iso["DE037"].astype(str).str.strip()
-    iso = iso.merge(hr_agg, left_on="DE037_str", right_on="DE037", how="left", suffixes=("", "_hr"))
+    case_no_int = pd.to_numeric(
+        iso["CASE_NO"].astype(str).str.strip(), errors="coerce"
+    ).fillna(0).astype(int)
 
-    fill_cols = ["rules_hit_count", "rules_tot_score", "rules_unique_count",
-                 "rad_rule_count", "cc_rule_count"]
-    fill_cols += [f"rule_{r}" for r in top_rules]
-    for c in fill_cols:
-        iso[c] = iso[c].fillna(0)
-    iso.drop(columns=["DE037_str", "DE037_hr"], errors="ignore", inplace=True)
+    iso["_case_no_int"] = case_no_int
+    iso["fraud"] = case_no_int.isin(confirmed_case_nos).astype(int)
+
+    # Exclude ambiguous transactions (cased but not confirmed fraud)
+    has_case = case_no_int > 0
+    is_confirmed = iso["fraud"] == 1
+    ambiguous = has_case & ~is_confirmed
+    iso = iso[~ambiguous].reset_index(drop=True)
+    iso.drop(columns=["_case_no_int"], inplace=True)
+
     return iso
 
 
 def engineer_features(df):
-    """Engineer features from transaction-level data only.
+    """Engineer features from transaction data only.
 
-    Avoids target leakage: no features computed using the fraud label.
-    Card/merchant/MCC aggregation uses only transaction-level stats (amount, count),
-    NOT fraud rates which would leak the target.
+    No hit-rules features (would be leakage with confirmed-fraud label).
+    Aggregation features computed here on full data, but will be
+    recomputed properly in prepare() after split.
     """
     df = df.copy()
 
     # === Amount features ===
     df["amount"] = df["DE004"].fillna(0).astype(float)
     df["log_amount"] = np.log1p(df["amount"])
-    df["amount_sq"] = df["amount"] ** 2
 
     # === Transaction type ===
     df["trx_typ"] = df["TRX_TYP"].astype(str).str.strip()
@@ -99,13 +71,13 @@ def engineer_features(df):
 
     # === Response code ===
     df["resp_code"] = df["DE039"].astype(str).str.strip()
-    resp_dummies = pd.get_dummies(df["resp_code"], prefix="resp")
-    df = pd.concat([df, resp_dummies], axis=1)
+    df["is_approved"] = (df["resp_code"] == "00").astype(int)
+    df["is_declined_fraud"] = (df["resp_code"] == "59").astype(int)  # suspected fraud
 
     # === Auth status ===
     df["auth_stat"] = df["TRANS_AUTH_STAT"].astype(str).str.strip()
-    auth_dummies = pd.get_dummies(df["auth_stat"], prefix="auth")
-    df = pd.concat([df, auth_dummies], axis=1)
+    df["is_auth_approved"] = (df["auth_stat"] == "").astype(int)
+    df["is_auth_declined"] = (df["auth_stat"] == "DD").astype(int)
 
     # === Card-present flags ===
     df["is_emv"] = (df["EMV_STAT"].astype(str).str.strip() == "Y").astype(int)
@@ -122,26 +94,6 @@ def engineer_features(df):
     df["currency"] = df["DE049"].astype(str).str.strip()
     df["is_foreign_currency"] = (df["currency"] != "458").astype(int)
 
-    # === Card-level aggregation (NO target leakage - only amount stats) ===
-    card_col = "REF_CRD_NO"
-    df["card_txn_count"] = df.groupby(card_col)["amount"].transform("count")
-    df["card_txn_mean"] = df.groupby(card_col)["amount"].transform("mean")
-    df["card_txn_std"] = df.groupby(card_col)["amount"].transform("std").fillna(0)
-    df["card_txn_max"] = df.groupby(card_col)["amount"].transform("max")
-    df["card_txn_min"] = df.groupby(card_col)["amount"].transform("min")
-    df["amount_vs_card_mean"] = df["amount"] / (df["card_txn_mean"] + 1)
-    df["amount_vs_card_max"] = df["amount"] / (df["card_txn_max"] + 1)
-    df["amount_zscore"] = (df["amount"] - df["card_txn_mean"]) / (df["card_txn_std"] + 1e-8)
-
-    # === Merchant-level aggregation (NO fraud rate - would leak target) ===
-    df["merchant_id"] = df["MMER_ID"].astype(str).str.strip()
-    df["merch_txn_count"] = df.groupby("merchant_id")["amount"].transform("count")
-    df["merch_txn_mean"] = df.groupby("merchant_id")["amount"].transform("mean")
-
-    # === MCC-level aggregation (NO fraud rate) ===
-    df["mcc_txn_count"] = df.groupby("mcc")["amount"].transform("count")
-    df["mcc_txn_mean"] = df.groupby("mcc")["amount"].transform("mean")
-
     # === Hour of day ===
     df["hour"] = pd.to_numeric(
         df["DE012"].astype(str).str.strip().str[:2], errors="coerce"
@@ -157,11 +109,6 @@ def engineer_features(df):
     df["eci_recurring"] = (eci_str == "002").astype(int)
     df["eci_moto"] = eci_str.isin(["001", "004"]).astype(int)
 
-    # === TTI ===
-    tti_str = df["TTI"].astype(str).str.strip()
-    tti_dummies = pd.get_dummies(tti_str, prefix="tti")
-    df = pd.concat([df, tti_dummies], axis=1)
-
     # === Payment network ===
     usr_str = df["USR_ID"].astype(str).str.strip()
     df["is_visa"] = usr_str.str.contains("VIS|VSA", na=False).astype(int)
@@ -174,14 +121,62 @@ def engineer_features(df):
     # === DE003 subfields ===
     de003_str = df["DE003"].astype(str).str.zfill(6)
     df["de003_txn_type"] = de003_str.str[:2]
-    de003_txn_dummies = pd.get_dummies(df["de003_txn_type"], prefix="d3txn")
-    df = pd.concat([df, de003_txn_dummies], axis=1)
+    de003_dummies = pd.get_dummies(df["de003_txn_type"], prefix="d3txn")
+    df = pd.concat([df, de003_dummies], axis=1)
 
-    # === Interaction features ===
+    # === Timestamp for temporal split ===
+    df["cre_tms"] = pd.to_numeric(df["CRE_TMS"], errors="coerce").fillna(0)
+
+    return df
+
+
+def compute_aggregation_features(df, train_df):
+    """Compute card/merchant/MCC aggregation using ONLY training data stats.
+
+    This avoids train-test leakage in aggregation features.
+    """
+    df = df.copy()
+    card_col = "REF_CRD_NO"
+
+    # Card-level stats from training data only
+    card_stats = train_df.groupby(card_col)["amount"].agg(
+        card_txn_count="count", card_txn_mean="mean",
+        card_txn_std="std", card_txn_max="max",
+    ).fillna(0)
+
+    df = df.merge(card_stats, left_on=card_col, right_index=True, how="left")
+    for c in ["card_txn_count", "card_txn_mean", "card_txn_std", "card_txn_max"]:
+        df[c] = df[c].fillna(0)
+    df["amount_vs_card_mean"] = df["amount"] / (df["card_txn_mean"] + 1)
+    df["amount_vs_card_max"] = df["amount"] / (df["card_txn_max"] + 1)
+    df["amount_zscore"] = (df["amount"] - df["card_txn_mean"]) / (df["card_txn_std"] + 1e-8)
+
+    # Merchant-level stats from training data only
+    merchant_col = "MMER_ID"
+    m_str_col = "_merch_str"
+    df[m_str_col] = df[merchant_col].astype(str).str.strip()
+    train_m = train_df.copy()
+    train_m[m_str_col] = train_m[merchant_col].astype(str).str.strip()
+    merch_stats = train_m.groupby(m_str_col)["amount"].agg(
+        merch_txn_count="count", merch_txn_mean="mean",
+    ).fillna(0)
+    df = df.merge(merch_stats, left_on=m_str_col, right_index=True, how="left")
+    for c in ["merch_txn_count", "merch_txn_mean"]:
+        df[c] = df[c].fillna(0)
+    df.drop(columns=[m_str_col], inplace=True)
+
+    # MCC-level stats from training data only
+    mcc_stats = train_df.groupby("mcc")["amount"].agg(
+        mcc_txn_count="count", mcc_txn_mean="mean",
+    ).fillna(0)
+    df = df.merge(mcc_stats, left_on="mcc", right_index=True, how="left")
+    for c in ["mcc_txn_count", "mcc_txn_mean"]:
+        df[c] = df[c].fillna(0)
+
+    # Interaction features
     df["amount_x_foreign"] = df["amount"] * df["is_foreign_currency"]
     df["amount_x_night"] = df["amount"] * df["is_night"]
     df["amount_x_ecom"] = df["amount"] * df["is_ecom"]
-    df["rules_x_amount"] = df["rules_hit_count"] * df["log_amount"]
 
     return df
 
@@ -200,24 +195,33 @@ def get_feature_columns(df):
         "ECI", "TTI", "NON_FIAT_IND", "DAF_IND", "URN",
         "LCL_TM_DE12", "LCL_DT_DE13", "COREBANK_CIF_NO",
         "trx_typ", "pos_entry", "resp_code", "auth_stat", "currency",
-        "merchant_id", "de003_txn_type", "DE037_str",
+        "de003_txn_type", "cre_tms",
     }
     return [c for c in df.columns if c not in exclude]
 
 
 def prepare():
-    iso, cases, hit_rules = load_data()
-    iso = create_label(iso)
-    iso = add_hit_rules_features(iso, hit_rules)
+    iso, cases = load_data()
+    iso = create_label(iso, cases)
     df = engineer_features(iso)
-    feature_cols = get_feature_columns(df)
 
-    X = df[feature_cols].values.astype(np.float32)
-    y = df["fraud"].values
+    # Time-based split: sort by creation timestamp, 80% train / 20% test
+    df = df.sort_values("cre_tms").reset_index(drop=True)
+    split_idx = int(len(df) * 0.8)
+    train_df = df.iloc[:split_idx].copy()
+    test_df = df.iloc[split_idx:].copy()
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
+    # Compute aggregation features using ONLY training data
+    train_df = compute_aggregation_features(train_df, train_df)
+    test_df = compute_aggregation_features(test_df, train_df)
+
+    feature_cols = get_feature_columns(train_df)
+
+    X_train = train_df[feature_cols].values.astype(np.float32)
+    y_train = train_df["fraud"].values
+    X_test = test_df[feature_cols].values.astype(np.float32)
+    y_test = test_df["fraud"].values
+
     return X_train, X_test, y_train, y_test, feature_cols
 
 
@@ -226,3 +230,5 @@ if __name__ == "__main__":
     print(f"Features: {len(feature_cols)}")
     print(f"Train: {X_train.shape}, fraud rate: {y_train.mean():.4f}")
     print(f"Test:  {X_test.shape}, fraud rate: {y_test.mean():.4f}")
+    print(f"Train fraud count: {y_train.sum()}")
+    print(f"Test fraud count: {y_test.sum()}")
