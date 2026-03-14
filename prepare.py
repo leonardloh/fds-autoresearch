@@ -230,12 +230,43 @@ def compute_aggregation_features(df, train_df):
     df["merch_risk"] = df["merch_risk"].fillna(global_mean)
     df.drop(columns=["_m2"], inplace=True)
 
+    # === Amount deviation from MCC norm (from training data) ===
+    mcc_amount_stats = train_df.groupby("mcc")["amount"].agg(
+        mcc_amount_mean="mean", mcc_amount_std="std",
+        mcc_amount_median="median",
+    ).fillna(0)
+    df = df.merge(mcc_amount_stats, left_on="mcc", right_index=True, how="left")
+    for c in ["mcc_amount_mean", "mcc_amount_std", "mcc_amount_median"]:
+        df[c] = df[c].fillna(0)
+    df["amount_vs_mcc_mean"] = df["amount"] / (df["mcc_amount_mean"] + 1)
+    df["amount_mcc_zscore"] = (df["amount"] - df["mcc_amount_mean"]) / (df["mcc_amount_std"] + 1e-8)
+    df["amount_vs_mcc_median"] = df["amount"] / (df["mcc_amount_median"] + 1)
+
+    # === Card amount variability features ===
+    df["card_amount_cv"] = df["card_txn_std"] / (df["card_txn_mean"] + 1e-8)  # coefficient of variation
+
+    # === POS entry risk (from training data) ===
+    pos_risk_data = train_df.copy()
+    pos_risk_data["_pos"] = pos_risk_data["DE022"].astype(str).str.strip() if "DE022" in pos_risk_data.columns else ""
+    df["_pos"] = df["DE022"].astype(str).str.strip() if "DE022" in df.columns else ""
+    if "_pos" in pos_risk_data.columns:
+        pos_fraud = pos_risk_data.groupby("_pos")["fraud"].agg(["mean", "count"])
+        pos_fraud["pos_risk"] = (
+            (pos_fraud["count"] * pos_fraud["mean"] + smoothing * global_mean)
+            / (pos_fraud["count"] + smoothing)
+        )
+        df = df.merge(pos_fraud[["pos_risk"]], left_on="_pos", right_index=True, how="left")
+        df["pos_risk"] = df["pos_risk"].fillna(global_mean)
+    df.drop(columns=["_pos"], errors="ignore", inplace=True)
+
     # Interaction features
     df["amount_x_foreign"] = df["amount"] * df["is_foreign_currency"]
     df["amount_x_night"] = df["amount"] * df["is_night"]
     df["amount_x_ecom"] = df["amount"] * df["is_ecom"]
     df["amount_x_mcc_risk"] = df["amount"] * df["mcc_risk"]
     df["amount_x_card_risk"] = df["amount"] * df["card_risk"]
+    df["log_amount_x_mcc_risk"] = df["log_amount"] * df["mcc_risk"]
+    df["velocity_x_amount"] = df["card_txn_count_24h"] * df["log_amount"]
 
     return df
 
