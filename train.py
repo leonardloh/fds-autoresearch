@@ -2,7 +2,7 @@ import time
 import numpy as np
 import xgboost as xgb
 from sklearn.metrics import f1_score, precision_score, recall_score
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import TimeSeriesSplit
 from prepare import prepare
 
 
@@ -30,14 +30,16 @@ def train():
     model.fit(X_train, y_train)
     training_seconds = time.time() - train_start
 
-    # Threshold tuning via CV on training data (not test set)
+    # Threshold tuning via temporal CV on training data (not test set)
     best_thresh = 0.5
     if y_train.sum() >= 5:
-        kf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+        tscv = TimeSeriesSplit(n_splits=3)
         best_cv_f1 = 0
         for t in np.arange(0.05, 0.95, 0.01):
             cv_scores = []
-            for tr_idx, val_idx in kf.split(X_train, y_train):
+            for tr_idx, val_idx in tscv.split(X_train):
+                if y_train[tr_idx].sum() == 0:
+                    continue
                 m = xgb.XGBClassifier(
                     n_estimators=200, max_depth=6, learning_rate=0.1,
                     scale_pos_weight=scale_pos_weight, eval_metric="logloss",
@@ -46,10 +48,11 @@ def train():
                 m.fit(X_train[tr_idx], y_train[tr_idx])
                 p = m.predict_proba(X_train[val_idx])[:, 1]
                 cv_scores.append(f1_score(y_train[val_idx], (p >= t).astype(int), zero_division=0))
-            mean_f1 = np.mean(cv_scores)
-            if mean_f1 > best_cv_f1:
-                best_cv_f1 = mean_f1
-                best_thresh = t
+            if cv_scores:
+                mean_f1 = np.mean(cv_scores)
+                if mean_f1 > best_cv_f1:
+                    best_cv_f1 = mean_f1
+                    best_thresh = t
 
     y_proba = model.predict_proba(X_test)[:, 1]
     y_pred = (y_proba >= best_thresh).astype(int)

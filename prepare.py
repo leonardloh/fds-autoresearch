@@ -113,6 +113,12 @@ def engineer_features(df):
     # === Timestamp for temporal split ===
     df["cre_tms"] = pd.to_numeric(df["CRE_TMS"], errors="coerce").fillna(0)
 
+    # === Settlement / billing amount features ===
+    df["settle_amount"] = df["DE005"].fillna(0).astype(float)
+    df["billing_amount"] = df["DE006"].fillna(0).astype(float)
+    df["amount_billing_diff"] = df["amount"] - df["billing_amount"]
+    df["amount_billing_ratio"] = df["amount"] / (df["billing_amount"] + 1)
+
     return df
 
 
@@ -159,10 +165,83 @@ def compute_aggregation_features(df, train_df):
     for c in ["mcc_txn_count", "mcc_txn_mean"]:
         df[c] = df[c].fillna(0)
 
+    # === Target-encoded risk (from training data only, with smoothing) ===
+    global_mean = train_df["fraud"].mean()
+    smoothing = 10  # regularization parameter
+
+    # MCC risk
+    mcc_fraud = train_df.groupby("mcc")["fraud"].agg(["mean", "count"])
+    mcc_fraud["mcc_risk"] = (
+        (mcc_fraud["count"] * mcc_fraud["mean"] + smoothing * global_mean)
+        / (mcc_fraud["count"] + smoothing)
+    )
+    df = df.merge(mcc_fraud[["mcc_risk"]], left_on="mcc", right_index=True, how="left")
+    df["mcc_risk"] = df["mcc_risk"].fillna(global_mean)
+
+    # Merchant risk
+    train_m2 = train_df.copy()
+    train_m2["_m2"] = train_m2["MMER_ID"].astype(str).str.strip()
+    df["_m2"] = df["MMER_ID"].astype(str).str.strip()
+    merch_fraud = train_m2.groupby("_m2")["fraud"].agg(["mean", "count"])
+    merch_fraud["merch_risk"] = (
+        (merch_fraud["count"] * merch_fraud["mean"] + smoothing * global_mean)
+        / (merch_fraud["count"] + smoothing)
+    )
+    df = df.merge(merch_fraud[["merch_risk"]], left_on="_m2", right_index=True, how="left")
+    df["merch_risk"] = df["merch_risk"].fillna(global_mean)
+    df.drop(columns=["_m2"], inplace=True)
+
+    # Card risk
+    card_fraud = train_df.groupby(card_col)["fraud"].agg(["mean", "count"])
+    card_fraud["card_risk"] = (
+        (card_fraud["count"] * card_fraud["mean"] + smoothing * global_mean)
+        / (card_fraud["count"] + smoothing)
+    )
+    df = df.merge(card_fraud[["card_risk"]], left_on=card_col, right_index=True, how="left")
+    df["card_risk"] = df["card_risk"].fillna(global_mean)
+
+    # === Velocity features (per-card transaction counts in time windows) ===
+    # Sort by card and time, compute rolling counts
+    df = df.sort_values(["REF_CRD_NO", "cre_tms"]).reset_index(drop=True)
+    for card_id in df["REF_CRD_NO"].unique():
+        mask = df["REF_CRD_NO"] == card_id
+        card_times = df.loc[mask, "cre_tms"].values
+        card_amounts = df.loc[mask, "amount"].values
+        n = len(card_times)
+
+        txn_count_24h = np.zeros(n)
+        txn_sum_24h = np.zeros(n)
+        txn_count_1h = np.zeros(n)
+
+        # Time windows: CRE_TMS format is YYYYMMDDHHMMSSmmm
+        # 1 hour = 10000000 (HHMM * 10^7), 24 hours = 240000000
+        one_hour = 10000000
+        twenty_four_hours = 240000000
+
+        for i in range(n):
+            t = card_times[i]
+            for j in range(i - 1, -1, -1):
+                diff = t - card_times[j]
+                if diff > twenty_four_hours:
+                    break
+                txn_count_24h[i] += 1
+                txn_sum_24h[i] += card_amounts[j]
+                if diff <= one_hour:
+                    txn_count_1h[i] += 1
+
+        df.loc[mask, "card_txn_count_1h"] = txn_count_1h
+        df.loc[mask, "card_txn_count_24h"] = txn_count_24h
+        df.loc[mask, "card_txn_sum_24h"] = txn_sum_24h
+
+    for c in ["card_txn_count_1h", "card_txn_count_24h", "card_txn_sum_24h"]:
+        df[c] = df[c].fillna(0)
+
     # Interaction features
     df["amount_x_foreign"] = df["amount"] * df["is_foreign_currency"]
     df["amount_x_night"] = df["amount"] * df["is_night"]
     df["amount_x_ecom"] = df["amount"] * df["is_ecom"]
+    df["amount_x_mcc_risk"] = df["amount"] * df["mcc_risk"]
+    df["amount_x_card_risk"] = df["amount"] * df["card_risk"]
 
     return df
 
