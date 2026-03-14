@@ -301,11 +301,12 @@ def compute_velocity_features(df):
     return df
 
 
-def compute_aggregation_features(df, train_df, is_train=False):
-    """Compute card/merchant/MCC aggregation + target encoding.
+def compute_aggregation_features(df, train_df):
+    """Compute card/merchant/MCC aggregation features from training data.
 
-    FIX #2: Target encoding now uses leave-one-out for training rows
-    so each row does not see its own label in the encoded value.
+    All features are amount-based or count-based — no label-derived features.
+    Target-encoded risk features (mcc_risk, card_risk, etc.) were removed
+    because they encode the training label distribution and cause overfitting.
     """
     df = df.copy()
     card_col = "REF_CRD_NO"
@@ -343,91 +344,13 @@ def compute_aggregation_features(df, train_df, is_train=False):
     for c in ["mcc_txn_count", "mcc_txn_mean"]:
         df[c] = df[c].fillna(0)
 
-    # === Target-encoded risk (FIX #2: leave-one-out for training) ===
-    global_mean = train_df["fraud"].mean()
-    smoothing = 10
-
-    for group_col, risk_name in [("mcc", "mcc_risk"), (card_col, "card_risk")]:
-        grp = train_df.groupby(group_col)["fraud"].agg(["sum", "count"])
-        grp.columns = ["_grp_sum", "_grp_count"]
-
-        if is_train:
-            # Leave-one-out: subtract this row's label from the group stats
-            df = df.merge(grp, left_on=group_col, right_index=True, how="left")
-            df["_grp_sum"] = df["_grp_sum"].fillna(0)
-            df["_grp_count"] = df["_grp_count"].fillna(0)
-            loo_sum = df["_grp_sum"] - df["fraud"]
-            loo_count = df["_grp_count"] - 1
-            df[risk_name] = (
-                (loo_count * (loo_sum / (loo_count + 1e-8)) + smoothing * global_mean)
-                / (loo_count + smoothing)
-            )
-            df.loc[loo_count <= 0, risk_name] = global_mean
-            df.drop(columns=["_grp_sum", "_grp_count"], inplace=True)
-        else:
-            # Test: standard smoothed encoding from full training stats
-            grp[risk_name] = (
-                (grp["_grp_sum"] + smoothing * global_mean)
-                / (grp["_grp_count"] + smoothing)
-            )
-            df = df.merge(grp[[risk_name]], left_on=group_col, right_index=True, how="left")
-            df[risk_name] = df[risk_name].fillna(global_mean)
-
-    # Merchant risk (same LOO pattern)
-    train_m2 = train_df.copy()
-    train_m2["_m2"] = train_m2["MMER_ID"].astype(str).str.strip()
-    df["_m2"] = df["MMER_ID"].astype(str).str.strip()
-    mf = train_m2.groupby("_m2")["fraud"].agg(["sum", "count"])
-    mf.columns = ["_grp_sum", "_grp_count"]
-
-    if is_train:
-        df = df.merge(mf, left_on="_m2", right_index=True, how="left")
-        df["_grp_sum"] = df["_grp_sum"].fillna(0)
-        df["_grp_count"] = df["_grp_count"].fillna(0)
-        loo_sum = df["_grp_sum"] - df["fraud"]
-        loo_count = df["_grp_count"] - 1
-        df["merch_risk"] = (
-            (loo_count * (loo_sum / (loo_count + 1e-8)) + smoothing * global_mean)
-            / (loo_count + smoothing)
-        )
-        df.loc[loo_count <= 0, "merch_risk"] = global_mean
-        df.drop(columns=["_grp_sum", "_grp_count"], inplace=True)
-    else:
-        mf["merch_risk"] = (
-            (mf["_grp_sum"] + smoothing * global_mean)
-            / (mf["_grp_count"] + smoothing)
-        )
-        df = df.merge(mf[["merch_risk"]], left_on="_m2", right_index=True, how="left")
-        df["merch_risk"] = df["merch_risk"].fillna(global_mean)
-    df.drop(columns=["_m2"], inplace=True)
-
-    # POS entry risk (LOO for train)
-    pos_risk_data = train_df.copy()
-    pos_risk_data["_pos"] = pos_risk_data["DE022"].astype(str).str.strip()
-    df["_pos"] = df["DE022"].astype(str).str.strip()
-    pf = pos_risk_data.groupby("_pos")["fraud"].agg(["sum", "count"])
-    pf.columns = ["_grp_sum", "_grp_count"]
-
-    if is_train:
-        df = df.merge(pf, left_on="_pos", right_index=True, how="left")
-        df["_grp_sum"] = df["_grp_sum"].fillna(0)
-        df["_grp_count"] = df["_grp_count"].fillna(0)
-        loo_sum = df["_grp_sum"] - df["fraud"]
-        loo_count = df["_grp_count"] - 1
-        df["pos_risk"] = (
-            (loo_count * (loo_sum / (loo_count + 1e-8)) + smoothing * global_mean)
-            / (loo_count + smoothing)
-        )
-        df.loc[loo_count <= 0, "pos_risk"] = global_mean
-        df.drop(columns=["_grp_sum", "_grp_count"], inplace=True)
-    else:
-        pf["pos_risk"] = (
-            (pf["_grp_sum"] + smoothing * global_mean)
-            / (pf["_grp_count"] + smoothing)
-        )
-        df = df.merge(pf[["pos_risk"]], left_on="_pos", right_index=True, how="left")
-        df["pos_risk"] = df["pos_risk"].fillna(global_mean)
-    df.drop(columns=["_pos"], errors="ignore", inplace=True)
+    # Target-encoded risk features REMOVED: mcc_risk, card_risk, merch_risk, pos_risk
+    # and their interaction features (amount_x_mcc_risk, amount_x_card_risk, log_amount_x_mcc_risk).
+    # These encode "historical flagging rate" from the training labels, creating a
+    # circular dependency: the label IS "was this flagged", and the risk features encode
+    # "how often was this card/MCC/merchant flagged". Even with LOO encoding, the model
+    # used them as a crutch for memorization (268 trees, overfit gap 0.61) rather than
+    # learning generalizable patterns from raw transaction features (8 trees, gap 0.05).
 
     # === Amount deviation from MCC norm (amount-based, no label leakage) ===
     mcc_amount_stats = train_df.groupby("mcc")["amount"].agg(
@@ -443,13 +366,10 @@ def compute_aggregation_features(df, train_df, is_train=False):
 
     df["card_amount_cv"] = df["card_txn_std"] / (df["card_txn_mean"] + 1e-8)
 
-    # Interaction features
+    # Interaction features (no label-derived risk features)
     df["amount_x_foreign"] = df["amount"] * df["is_foreign_currency"]
     df["amount_x_night"] = df["amount"] * df["is_night"]
     df["amount_x_ecom"] = df["amount"] * df["is_ecom"]
-    df["amount_x_mcc_risk"] = df["amount"] * df["mcc_risk"]
-    df["amount_x_card_risk"] = df["amount"] * df["card_risk"]
-    df["log_amount_x_mcc_risk"] = df["log_amount"] * df["mcc_risk"]
     df["velocity_x_amount"] = df["card_txn_count_24h"] * df["log_amount"]
     df["velocity_10m_x_amount"] = df["card_txn_count_10min"] * df["log_amount"]
 
@@ -491,8 +411,8 @@ def prepare():
     test_df = add_dummies(test_df, train_df)
 
     # FIX #2: LOO target encoding for train, standard for test
-    train_df = compute_aggregation_features(train_df, train_df, is_train=True)
-    test_df = compute_aggregation_features(test_df, train_df, is_train=False)
+    train_df = compute_aggregation_features(train_df, train_df)
+    test_df = compute_aggregation_features(test_df, train_df)
 
     feature_cols = get_feature_columns(train_df)
 
@@ -522,8 +442,8 @@ def prepare_prioritization():
     test_df = add_dummies(test_df, train_df)
 
     # FIX #2: LOO target encoding for train, standard for test
-    train_df = compute_aggregation_features(train_df, train_df, is_train=True)
-    test_df = compute_aggregation_features(test_df, train_df, is_train=False)
+    train_df = compute_aggregation_features(train_df, train_df)
+    test_df = compute_aggregation_features(test_df, train_df)
 
     feature_cols = get_feature_columns(train_df)
 
