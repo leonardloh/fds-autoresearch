@@ -9,37 +9,55 @@ def load_data():
     return iso, cases, cuh
 
 
-def create_label(iso, cases, cuh):
-    """Label: fraud=1 if transaction has a valid CASE_NO (flagged for investigation).
+def create_base_label(iso):
+    """Base label: fraud=1 if transaction has a valid CASE_NO (flagged for investigation).
 
-    Clean labels using Case_Update_History:
-    - Status 750 = confirmed non-fraud (analyst reviewed, normal transaction)
-    - These cases are flipped to fraud=0.
+    Label cleaning (flipping confirmed non-fraud to 0) is deferred to
+    _clean_labels_as_of() so it can respect point-in-time constraints.
     """
     iso = iso.copy()
     case_no_int = pd.to_numeric(
         iso["CASE_NO"].astype(str).str.strip(), errors="coerce"
     ).fillna(0).astype(int)
     iso["fraud"] = (case_no_int > 0).astype(int)
+    return iso
 
-    # Clean labels: remove confirmed non-fraud (status 750) from positives
-    after = cuh[cuh["B4_AFTER_IND"].astype(str).str.strip() == "A"]
+
+def _get_cleared_cases(cuh, as_of_ts=None):
+    """Get case numbers confirmed as non-fraud (status 750).
+
+    If as_of_ts is provided, only use CUH resolutions with timestamp <= as_of_ts
+    (point-in-time correctness: training labels must not use future analyst decisions).
+    """
+    after = cuh[cuh["B4_AFTER_IND"].astype(str).str.strip() == "A"].copy()
+    if as_of_ts is not None:
+        after_ts = _parse_cre_tms_to_seconds(after["CRE_TMS"])
+        after = after[after_ts <= as_of_ts]
+    if len(after) == 0:
+        return set()
     after_sorted = after.sort_values("CRE_TMS")
     last_per_case = after_sorted.groupby("CASE_NO").last()
-    cleared_cases = set(
+    return set(
+        int(x) for x in
         last_per_case[last_per_case["CASE_STATUS"] == 750].index.values
     )
-    if cleared_cases:
-        iso.loc[
-            iso["fraud"] == 1,
-            "fraud"
-        ] = iso.loc[iso["fraud"] == 1, "CASE_NO"].apply(
-            lambda x: 0 if int(
-                pd.to_numeric(str(x).strip(), errors="coerce") or 0
-            ) in cleared_cases else 1
-        )
 
-    return iso
+
+def _clean_labels_as_of(df, cuh, as_of_ts=None):
+    """Flip confirmed non-fraud (status 750) to fraud=0, respecting as_of_ts.
+
+    as_of_ts=None uses full CUH history (correct for test/evaluation labels).
+    as_of_ts=<timestamp> only uses resolutions known by that time (for training).
+    """
+    df = df.copy()
+    cleared_cases = _get_cleared_cases(cuh, as_of_ts=as_of_ts)
+    if cleared_cases:
+        case_no_int = pd.to_numeric(
+            df["CASE_NO"].astype(str).str.strip(), errors="coerce"
+        ).fillna(0).astype(int)
+        mask = (df["fraud"] == 1) & case_no_int.isin(cleared_cases)
+        df.loc[mask, "fraud"] = 0
+    return df
 
 
 def _parse_cre_tms_to_seconds(cre_tms_series):
@@ -301,72 +319,130 @@ def compute_velocity_features(df):
     return df
 
 
-def compute_aggregation_features(df, train_df):
-    """Compute card/merchant/MCC aggregation features from training data.
+def _expanding_past_only(df, group_col, value_col, agg_funcs):
+    """Compute expanding-window stats using only prior rows (point-in-time safe).
 
-    All features are amount-based or count-based — no label-derived features.
-    Target-encoded risk features (mcc_risk, card_risk, etc.) were removed
-    because they encode the training label distribution and cause overfitting.
+    For each row, statistics are computed from all earlier rows in the same group.
+    The current row is excluded via shift(1).
+    df must be sorted by cre_tms before calling.
     """
+    grouped = df.groupby(group_col)[value_col]
+    result = {}
+    for name, func in agg_funcs.items():
+        if func == "count":
+            result[name] = grouped.transform(
+                lambda x: x.shift(1).expanding().count()
+            ).fillna(0)
+        elif func == "mean":
+            result[name] = grouped.transform(
+                lambda x: x.shift(1).expanding().mean()
+            ).fillna(0)
+        elif func == "std":
+            result[name] = grouped.transform(
+                lambda x: x.shift(1).expanding().std()
+            ).fillna(0)
+        elif func == "max":
+            result[name] = grouped.transform(
+                lambda x: x.shift(1).expanding().max()
+            ).fillna(0)
+        elif func == "median":
+            result[name] = grouped.transform(
+                lambda x: x.shift(1).expanding().median()
+            ).fillna(0)
+    return result
+
+
+def compute_aggregation_features(df, train_df):
+    """Compute card/merchant/MCC aggregation features with point-in-time correctness.
+
+    Training rows (df is train_df): expanding past-only windows so each transaction
+    only sees statistics from temporally earlier transactions — no future leakage.
+    Test rows: full train_df statistics (all training data precedes test temporally).
+    """
+    is_train = (df is train_df)
     df = df.copy()
     card_col = "REF_CRD_NO"
 
-    # Card-level stats (amount-based, no label leakage)
-    card_stats = train_df.groupby(card_col)["amount"].agg(
-        card_txn_count="count", card_txn_mean="mean",
-        card_txn_std="std", card_txn_max="max",
-    ).fillna(0)
-    df = df.merge(card_stats, left_on=card_col, right_index=True, how="left")
-    for c in ["card_txn_count", "card_txn_mean", "card_txn_std", "card_txn_max"]:
-        df[c] = df[c].fillna(0)
+    if is_train:
+        # Point-in-time: each row only sees stats from earlier transactions
+        sorted_df = df.sort_values("cre_tms")
+
+        # Card-level expanding stats
+        card_agg = _expanding_past_only(sorted_df, card_col, "amount", {
+            "card_txn_count": "count", "card_txn_mean": "mean",
+            "card_txn_std": "std", "card_txn_max": "max",
+        })
+        for col, vals in card_agg.items():
+            sorted_df[col] = vals
+
+        # Merchant-level expanding stats
+        sorted_df["_merch_str"] = sorted_df["MMER_ID"].astype(str).str.strip()
+        merch_agg = _expanding_past_only(sorted_df, "_merch_str", "amount", {
+            "merch_txn_count": "count", "merch_txn_mean": "mean",
+        })
+        for col, vals in merch_agg.items():
+            sorted_df[col] = vals
+        sorted_df.drop(columns=["_merch_str"], inplace=True)
+
+        # MCC-level expanding stats
+        mcc_agg = _expanding_past_only(sorted_df, "mcc", "amount", {
+            "mcc_txn_count": "count", "mcc_txn_mean": "mean",
+            "mcc_amount_mean": "mean", "mcc_amount_std": "std",
+            "mcc_amount_median": "median",
+        })
+        for col, vals in mcc_agg.items():
+            sorted_df[col] = vals
+
+        # Restore original index order
+        df = sorted_df.sort_index()
+
+    else:
+        # Test data: all train_df is temporally before test — batch stats are correct
+        card_stats = train_df.groupby(card_col)["amount"].agg(
+            card_txn_count="count", card_txn_mean="mean",
+            card_txn_std="std", card_txn_max="max",
+        ).fillna(0)
+        df = df.merge(card_stats, left_on=card_col, right_index=True, how="left")
+        for c in ["card_txn_count", "card_txn_mean", "card_txn_std", "card_txn_max"]:
+            df[c] = df[c].fillna(0)
+
+        m_col = "_merch_str"
+        df[m_col] = df["MMER_ID"].astype(str).str.strip()
+        train_m = train_df.copy()
+        train_m[m_col] = train_m["MMER_ID"].astype(str).str.strip()
+        merch_stats = train_m.groupby(m_col)["amount"].agg(
+            merch_txn_count="count", merch_txn_mean="mean",
+        ).fillna(0)
+        df = df.merge(merch_stats, left_on=m_col, right_index=True, how="left")
+        for c in ["merch_txn_count", "merch_txn_mean"]:
+            df[c] = df[c].fillna(0)
+        df.drop(columns=[m_col], inplace=True)
+
+        mcc_stats = train_df.groupby("mcc")["amount"].agg(
+            mcc_txn_count="count", mcc_txn_mean="mean",
+        ).fillna(0)
+        df = df.merge(mcc_stats, left_on="mcc", right_index=True, how="left")
+        for c in ["mcc_txn_count", "mcc_txn_mean"]:
+            df[c] = df[c].fillna(0)
+
+        mcc_amount_stats = train_df.groupby("mcc")["amount"].agg(
+            mcc_amount_mean="mean", mcc_amount_std="std",
+            mcc_amount_median="median",
+        ).fillna(0)
+        df = df.merge(mcc_amount_stats, left_on="mcc", right_index=True, how="left")
+        for c in ["mcc_amount_mean", "mcc_amount_std", "mcc_amount_median"]:
+            df[c] = df[c].fillna(0)
+
+    # Derived features (same for both paths)
     df["amount_vs_card_mean"] = df["amount"] / (df["card_txn_mean"] + 1)
     df["amount_vs_card_max"] = df["amount"] / (df["card_txn_max"] + 1)
     df["amount_zscore"] = (df["amount"] - df["card_txn_mean"]) / (df["card_txn_std"] + 1e-8)
-
-    # Merchant-level stats (amount-based)
-    m_col = "_merch_str"
-    df[m_col] = df["MMER_ID"].astype(str).str.strip()
-    train_m = train_df.copy()
-    train_m[m_col] = train_m["MMER_ID"].astype(str).str.strip()
-    merch_stats = train_m.groupby(m_col)["amount"].agg(
-        merch_txn_count="count", merch_txn_mean="mean",
-    ).fillna(0)
-    df = df.merge(merch_stats, left_on=m_col, right_index=True, how="left")
-    for c in ["merch_txn_count", "merch_txn_mean"]:
-        df[c] = df[c].fillna(0)
-    df.drop(columns=[m_col], inplace=True)
-
-    # MCC-level stats (amount-based)
-    mcc_stats = train_df.groupby("mcc")["amount"].agg(
-        mcc_txn_count="count", mcc_txn_mean="mean",
-    ).fillna(0)
-    df = df.merge(mcc_stats, left_on="mcc", right_index=True, how="left")
-    for c in ["mcc_txn_count", "mcc_txn_mean"]:
-        df[c] = df[c].fillna(0)
-
-    # Target-encoded risk features REMOVED: mcc_risk, card_risk, merch_risk, pos_risk
-    # and their interaction features (amount_x_mcc_risk, amount_x_card_risk, log_amount_x_mcc_risk).
-    # These encode "historical flagging rate" from the training labels, creating a
-    # circular dependency: the label IS "was this flagged", and the risk features encode
-    # "how often was this card/MCC/merchant flagged". Even with LOO encoding, the model
-    # used them as a crutch for memorization (268 trees, overfit gap 0.61) rather than
-    # learning generalizable patterns from raw transaction features (8 trees, gap 0.05).
-
-    # === Amount deviation from MCC norm (amount-based, no label leakage) ===
-    mcc_amount_stats = train_df.groupby("mcc")["amount"].agg(
-        mcc_amount_mean="mean", mcc_amount_std="std",
-        mcc_amount_median="median",
-    ).fillna(0)
-    df = df.merge(mcc_amount_stats, left_on="mcc", right_index=True, how="left")
-    for c in ["mcc_amount_mean", "mcc_amount_std", "mcc_amount_median"]:
-        df[c] = df[c].fillna(0)
     df["amount_vs_mcc_mean"] = df["amount"] / (df["mcc_amount_mean"] + 1)
     df["amount_mcc_zscore"] = (df["amount"] - df["mcc_amount_mean"]) / (df["mcc_amount_std"] + 1e-8)
     df["amount_vs_mcc_median"] = df["amount"] / (df["mcc_amount_median"] + 1)
-
     df["card_amount_cv"] = df["card_txn_std"] / (df["card_txn_mean"] + 1e-8)
 
-    # Interaction features (no label-derived risk features)
+    # Interaction features
     df["amount_x_foreign"] = df["amount"] * df["is_foreign_currency"]
     df["amount_x_night"] = df["amount"] * df["is_night"]
     df["amount_x_ecom"] = df["amount"] * df["is_ecom"]
@@ -396,21 +472,27 @@ def get_feature_columns(df):
 
 def prepare():
     iso, cases, cuh = load_data()
-    iso = create_label(iso, cases, cuh)
+    iso = create_base_label(iso)
     df = engineer_features(iso)
 
     df = df.sort_values("cre_tms").reset_index(drop=True)
     split_idx = int(len(df) * 0.8)
+    split_ts = df.iloc[split_idx - 1]["cre_tms"]
 
     df = compute_velocity_features(df)
 
     train_df = df.iloc[:split_idx].copy()
     test_df = df.iloc[split_idx:].copy()
 
+    # Point-in-time label cleaning: training labels only use analyst
+    # decisions known at the split timestamp, not future resolutions.
+    # Test labels use full history (ground truth for evaluation).
+    train_df = _clean_labels_as_of(train_df, cuh, as_of_ts=split_ts)
+    test_df = _clean_labels_as_of(test_df, cuh, as_of_ts=None)
+
     train_df = add_dummies(train_df, train_df)
     test_df = add_dummies(test_df, train_df)
 
-    # FIX #2: LOO target encoding for train, standard for test
     train_df = compute_aggregation_features(train_df, train_df)
     test_df = compute_aggregation_features(test_df, train_df)
 
@@ -427,21 +509,25 @@ def prepare():
 def prepare_prioritization():
     """Prepare data with case-level metadata for prioritization evaluation."""
     iso, cases, cuh = load_data()
-    iso = create_label(iso, cases, cuh)
+    iso = create_base_label(iso)
     df = engineer_features(iso)
 
     df = df.sort_values("cre_tms").reset_index(drop=True)
     split_idx = int(len(df) * 0.8)
+    split_ts = df.iloc[split_idx - 1]["cre_tms"]
 
     df = compute_velocity_features(df)
 
     train_df = df.iloc[:split_idx].copy()
     test_df = df.iloc[split_idx:].copy()
 
+    # Point-in-time label cleaning
+    train_df = _clean_labels_as_of(train_df, cuh, as_of_ts=split_ts)
+    test_df = _clean_labels_as_of(test_df, cuh, as_of_ts=None)
+
     train_df = add_dummies(train_df, train_df)
     test_df = add_dummies(test_df, train_df)
 
-    # FIX #2: LOO target encoding for train, standard for test
     train_df = compute_aggregation_features(train_df, train_df)
     test_df = compute_aggregation_features(test_df, train_df)
 
@@ -457,7 +543,7 @@ def prepare_prioritization():
         test_df["CASE_NO"].astype(str).str.strip(), errors="coerce"
     ).fillna(0).astype(int).values
 
-    # Get confirmed fraud/non-fraud case numbers
+    # Confirmed fraud/non-fraud from full CUH history (ground truth for eval)
     after = cuh[cuh["B4_AFTER_IND"].astype(str).str.strip() == "A"]
     last_per_case = after.sort_values("CRE_TMS").groupby("CASE_NO").last()
     confirmed_fraud = set(int(x) for x in
