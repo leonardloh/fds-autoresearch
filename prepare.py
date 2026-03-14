@@ -465,6 +465,51 @@ def prepare():
     return X_train, X_test, y_train, y_test, feature_cols
 
 
+def prepare_prioritization():
+    """Prepare data with case-level metadata for prioritization evaluation."""
+    iso, cases, cuh = load_data()
+    iso = create_label(iso, cases, cuh)
+    df = engineer_features(iso)
+
+    # Time-based split
+    df = df.sort_values("cre_tms").reset_index(drop=True)
+    split_idx = int(len(df) * 0.8)
+
+    df = compute_velocity_features(df)
+
+    train_df = df.iloc[:split_idx].copy()
+    test_df = df.iloc[split_idx:].copy()
+
+    train_df = add_dummies(train_df, train_df)
+    test_df = add_dummies(test_df, train_df)
+
+    train_df = compute_aggregation_features(train_df, train_df)
+    test_df = compute_aggregation_features(test_df, train_df)
+
+    feature_cols = get_feature_columns(train_df)
+
+    X_train = train_df[feature_cols].values.astype(np.float32)
+    y_train = train_df["fraud"].values
+    X_test = test_df[feature_cols].values.astype(np.float32)
+    y_test = test_df["fraud"].values
+
+    # Case-level info for prioritization eval
+    test_case_nos = pd.to_numeric(
+        test_df["CASE_NO"].astype(str).str.strip(), errors="coerce"
+    ).fillna(0).astype(int).values
+
+    # Get confirmed fraud/non-fraud case numbers
+    after = cuh[cuh["B4_AFTER_IND"].astype(str).str.strip() == "A"]
+    last_per_case = after.sort_values("CRE_TMS").groupby("CASE_NO").last()
+    confirmed_fraud = set(int(x) for x in
+        last_per_case[last_per_case["CASE_STATUS"] == 700].index.values)
+    confirmed_nf = set(int(x) for x in
+        last_per_case[last_per_case["CASE_STATUS"] == 750].index.values)
+
+    return (X_train, X_test, y_train, y_test, feature_cols,
+            test_case_nos, confirmed_fraud, confirmed_nf)
+
+
 if __name__ == "__main__":
     X_train, X_test, y_train, y_test, feature_cols = prepare()
     print(f"Features: {len(feature_cols)}")
