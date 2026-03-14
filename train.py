@@ -11,10 +11,8 @@ def train():
 
     X_train, X_test, y_train, y_test, feature_cols = prepare()
 
-    # Class weight -- use sqrt to reduce noise amplification with noisy labels
-    n_neg = (y_train == 0).sum()
-    n_pos = max((y_train == 1).sum(), 1)
-    scale_pos_weight = np.sqrt(n_neg / n_pos)
+    # Class weight -- use 1.0 (no upweighting) to favor precision over recall
+    scale_pos_weight = 1.0
 
     model = xgb.XGBClassifier(
         n_estimators=300,
@@ -42,12 +40,10 @@ def train():
         for tr_idx, val_idx in tscv.split(X_train):
             if y_train[tr_idx].sum() == 0:
                 continue
-            fold_neg = (y_train[tr_idx] == 0).sum()
-            fold_pos = max((y_train[tr_idx] == 1).sum(), 1)
             m = xgb.XGBClassifier(
                 n_estimators=300, max_depth=4, learning_rate=0.1,
                 min_child_weight=5, subsample=0.8, colsample_bytree=0.8,
-                scale_pos_weight=np.sqrt(fold_neg / fold_pos),
+                scale_pos_weight=1.0,
                 eval_metric="logloss", random_state=42, n_jobs=-1,
             )
             m.fit(X_train[tr_idx], y_train[tr_idx])
