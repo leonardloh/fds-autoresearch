@@ -9,11 +9,17 @@ To set up a new experiment, work with the user to:
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
 3. **Read the in-scope files**: The repo is small. Read these files for full context:
    - `CONTEXT.md` — repository context.
-   - `prepare.py` — the file you modify to load the data, create training and test set, perform feature engineering and find the best features.
-   - `train.py` — the file you modify. Model architecture, optimizer, training loop. Prefer explainable model like xgboost.
+   - `prepare.py` — the file you modify to load the data, create training and test set, perform feature engineering and find the best features. FOCUS YOUR TIME HERE! Use data centric ai approach! Becareful on how you label the data as fraud / non-fraud since some of the cases that labelled as fraud are dropped eventually. 
+   - `train.py` — don't spend too much time here trying different model, focus on one model. Don't need to worry too much tuning tree layers, changing seed number to improve the F1 score.
 4. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
 5. **Confirm and go**: Confirm setup looks good.
 Once you get confirmation, kick off the experimentation.
+
+## Be creative on the solution
+1. no need to force yourself to create a binary model (fraud / non-fraud)
+2. it could be fraud / likely-fraud / non-fraud
+3. although you should avoid data-leakage, but if you found that some feature in the rules are useful for you to create the model, use it.
+4. you can also come out with a solution that combine both rule based features and hand crafted features.
 
 ## Experimentation
 You launch it simply as: `uv run train.py`.
