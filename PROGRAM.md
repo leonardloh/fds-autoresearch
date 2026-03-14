@@ -1,6 +1,31 @@
 # autoresearch
 
-This is an experiment to have the LLM do its own research on developing it's own fraud detection algorithm.
+This is an experiment to have the LLM do its own research on developing a fraud detection algorithm.
+
+## Problem reframing
+
+The original goal was binary classification (fraud / non-fraud). After extensive experimentation, we discovered:
+
+1. **The label `CASE_NO > 0` means "flagged by the CC rule system"**, not "confirmed fraud."
+2. **ALL CC rule features are data leakage** — CC rules fire as part of the case creation pipeline that produces `CASE_NO`. Using CC rule outputs to predict `CASE_NO > 0` is circular (the system predicting its own output). This includes both "notification" rules (NOT1, N001, TA*) AND "detection" rules (TSCC*, QACC*, CC*).
+3. **RAD rule features are NOT leakage** (they fire pre-authorization, independently of case creation) — but they only cover 2.1% of fraud transactions, providing minimal signal.
+4. The existing rule system itself has a massive false alarm problem: 4,415 transactions flagged, only 33 confirmed as fraud (CUH status 700), 17 confirmed as non-fraud (CUH status 750), ~4,365 unresolved.
+5. Without rule features, the binary F1 caps at ~0.41 because the model inherits the rule system's false alarm rate.
+
+**New objective: PRIORITIZATION MODEL.** Instead of binary fraud/non-fraud, build a model that ranks flagged cases by fraud likelihood so analysts review the most suspicious ones first.
+
+## What constitutes data leakage
+
+- **ALL CC rule outputs** (binary rule hits, rule counts, rule scores, individual rule IDs) — these are intermediate outputs of the case creation pipeline that produces the label.
+- **Response codes / auth status** (DE039, TRANS_AUTH_STAT) — these encode post-decision information.
+- **Settlement amounts** (DE005) — identical to DE004 in this dataset, adds no signal. DE006 (billing amount) differs only for currency conversions, already captured by `is_foreign_currency`.
+
+## What is allowed
+
+- **RAD rule features**: Pre-authorization, independent of case creation. Low coverage but legitimate.
+- **Rule-INSPIRED features from raw data**: Understand what rules check, then compute the underlying signal from raw transaction data. Example: if a rule checks "> 3 transactions in 10 minutes", compute `card_txn_count_10min` from raw timestamps. This captures the continuous signal without using the rule system's output.
+- **All raw transaction attributes**: Amount, MCC, POS entry mode, EMV/chip/contactless status, CVC2, ECI, currency, timestamps, card/merchant IDs.
+- **Engineered features**: Velocity, volume, target encoding, behavioral patterns — all computed from raw data.
 
 ## Setup
 To set up a new experiment, work with the user to:
@@ -9,62 +34,82 @@ To set up a new experiment, work with the user to:
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
 3. **Read the in-scope files**: The repo is small. Read these files for full context:
    - `CONTEXT.md` — repository context.
-   - `prepare.py` — the file you modify to load the data, create training and test set, perform feature engineering and find the best features. FOCUS YOUR TIME HERE! Use data centric ai approach! Becareful on how you label the data as fraud / non-fraud since some of the cases that labelled as fraud are dropped eventually. 
-   - `train.py` — don't spend too much time here trying different model, focus on one model. Don't need to worry too much tuning tree layers, changing seed number to improve the F1 score.
+   - `prepare.py` — feature engineering, label creation, data splitting. FOCUS YOUR TIME HERE! Use data centric ai approach!
+   - `train.py` — model training + dual evaluation (binary F1 + prioritization AUC/Precision@k).
 4. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
 5. **Confirm and go**: Confirm setup looks good.
 Once you get confirmation, kick off the experimentation.
 
-## Be creative on the solution
-1. no need to force yourself to create a binary model (fraud / non-fraud)
-2. it could be fraud / likely-fraud / non-fraud
-3. STRICTLY AVOID DATA LEAKAGE, DO NOT USE ANY RULE BASED FEATURE DIRECTLY! instead, understand what type of rule that a case got triggered. For example a rule with > 1000 transactions in a min, use this as part of the feature engineering instead.
-4. you can also come out with a solution that combine both rule based features and hand crafted features.
-
 ## Experimentation
 You launch it simply as: `uv run train.py`.
 
-The goal is simple: get the highest F1 score. The training speed should be fast since it is run on CPU.
-## Output format
+The script outputs two evaluations:
 
-Once the script finishes it prints a summary like this:
-
+### 1. Binary classification (flagged vs not-flagged)
 ```
 ---
-f1:          0.997900
-precision:  0.887132
-recall:     0.980123
-training_seconds: 300.1
-total_seconds:    325.9
+f1:          0.407761
+precision:  0.260787
+recall:     0.934337
+training_seconds: 0.7
+total_seconds:    6.0
+---
+```
+
+### 2. Prioritization (ranking confirmed cases)
+```
+=== PRIORITIZATION (all confirmed cases) ===
+Confirmed fraud cases: 30
+Confirmed non-fraud cases: 16
+AUC (case-level, max score):   0.6167
+Avg Precision (max score):     0.7654
+Precision@5:  0.800 (4/5 fraud)
+Precision@10: 0.800 (8/10 fraud)
+```
+
+### Primary metric: AUC (case-level)
+The primary goal is to maximize **AUC** on confirmed cases — how well the model separates confirmed fraud from confirmed non-fraud in the ranking. Higher AUC = analysts find real fraud faster.
+
+Secondary metrics: Precision@5, Precision@10 (how many of the top-k ranked cases are real fraud).
+
+Binary F1 is tracked but is a secondary concern (capped by label noise).
+
+## Output format
+
+The script prints both evaluations. Read them with:
+```
+grep "^f1:\|^precision:\|^recall:\|^AUC\|^Avg Prec\|^Precision@" run.log
 ```
 
 ## Logging results
 
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
+When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated).
 
-The TSV has a header row and 6 columns:
+The TSV has a header row and 8 columns:
 
 ```
-commit	f1	precision   recall	status	description
+commit	f1	auc	p_at_5	p_at_10	precision	recall	status	description
 ```
 
 1. git commit hash (short, 7 chars)
-2. f1 achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. precision acheived (e.g. 1.234567) — use 0.000000 for crashes
-4. recall acheived (e.g. 1.234567) — use 0.000000 for crashes
-5. status: `keep`, `discard`, or `crash`
-6. short text description of what this experiment tried
+2. f1 achieved — use 0.000000 for crashes
+3. auc (case-level prioritization AUC) — use 0.000000 for crashes
+4. p_at_5 (Precision@5) — use 0.000000 for crashes
+5. p_at_10 (Precision@10) — use 0.000000 for crashes
+6. precision (binary classification)
+7. recall (binary classification)
+8. status: `keep`, `discard`, or `crash`
+9. short text description of what this experiment tried
 
 Example:
 ```
-commit	f1	precision	recall	status	description  review
-c2d8f3a	0.000000	0.000000	0.000000	crash	OOM encoding high-cardinality merchant_id one-hot   potential data-leakage for features used: CASE_NO
-e5a1b7c	0.851234	0.812345	0.894567	keep	target-encoded merchant_id + frequency features
-f9c3d2e	0.839012	0.856789	0.821890	discard	oversampled fraud class with SMOTE - precision up but recall dropped
+commit	f1	auc	p_at_5	p_at_10	precision	recall	status	description
+a2cab76	0.407761	0.6167	0.800	0.800	0.260787	0.934337	keep	Baseline: rule-inspired features from raw data
 ```
+
 ## The experiment loop
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5`).
+The experiment runs on a dedicated branch (e.g. `autoresearch/mar14b`).
 
 LOOP FOREVER:
 
@@ -72,17 +117,32 @@ LOOP FOREVER:
 2. Tune `prepare.py` and/or `train.py` with an experimental idea by directly hacking the code.
 3. git commit.
 4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context).
-5. Read out the results: `grep "^f1:\|^precision:\|^recall:" run.log`
+5. Read out the results: `grep "^f1:\|^precision:\|^recall:\|^AUC\|^Avg Prec\|^Precision@" run.log`
 6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Spawn a review agent that reads REVIEW.md.
-7. Record the results and the agent review in `results.tsv` (NOTE: do not commit results.tsv, leave it untracked by git).
-8. If F1 improved (higher) and pass the review agent, you "advance" the branch, keeping the git commit.
-9. If F1 is equal or worse or you're told that you have data leakage in your feature, you `git reset` back to where you started and fix the code.
-
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
+7. Record the results in `results.tsv` (NOTE: do not commit results.tsv, leave it untracked by git).
+8. If AUC improved (higher), you "advance" the branch, keeping the git commit.
+9. If AUC is equal or worse, you `git reset` back to where you started.
 
 **Timeout**: Each experiment should be fast since it runs on CPU. If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
 
 **Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log `crash` as the status in the tsv, and move on.
 
 **NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — re-read CONTEXT.md, prepare.py and train.py for new angles, try combining previous near-misses, try more radical feature engineering or model changes. The loop runs until the human interrupts you, period.
+
+## Ideas to explore
+
+Feature engineering (from raw data, no rule outputs):
+- More granular velocity windows (2min, 5min, 30min)
+- Per-MCC velocity (e.g., count at MCC 5411 in 1h)
+- Average transaction amount in window (AVERAGE rules)
+- Same-amount repeat detection (TSCC2: same amount 5x in 60min)
+- Terminal diversity (TSCC14: different terminals in 30min)
+- Time-of-day interactions (midnight + contactless + high amount)
+- Card age / first-seen features
+- Merchant category risk tiers
+
+Model approaches:
+- Two-stage: first predict flagged/not, then rank within flagged
+- Semi-supervised: use the 50 confirmed labels more directly
+- Different objectives: LambdaRank or pairwise ranking loss
+- Probability calibration for better risk scores
