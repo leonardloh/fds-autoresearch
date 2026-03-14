@@ -494,6 +494,9 @@ def prepare_prioritization():
     y_test = test_df["fraud"].values
 
     # Case-level info for prioritization eval
+    train_case_nos = pd.to_numeric(
+        train_df["CASE_NO"].astype(str).str.strip(), errors="coerce"
+    ).fillna(0).astype(int).values
     test_case_nos = pd.to_numeric(
         test_df["CASE_NO"].astype(str).str.strip(), errors="coerce"
     ).fillna(0).astype(int).values
@@ -507,7 +510,7 @@ def prepare_prioritization():
         last_per_case[last_per_case["CASE_STATUS"] == 750].index.values)
 
     return (X_train, X_test, y_train, y_test, feature_cols,
-            test_case_nos, confirmed_fraud, confirmed_nf)
+            train_case_nos, test_case_nos, confirmed_fraud, confirmed_nf)
 
 
 if __name__ == "__main__":
