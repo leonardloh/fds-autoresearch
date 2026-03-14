@@ -66,6 +66,8 @@ def train():
     print(f"training_seconds: {training_seconds:.1f}")
     print(f"total_seconds:    {total_seconds:.1f}")
 
+    print("---")
+
 
 if __name__ == "__main__":
     train()

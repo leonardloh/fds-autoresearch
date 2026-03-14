@@ -5,7 +5,8 @@ import numpy as np
 def load_data():
     iso = pd.read_excel("Dataset/ISO8583_Transaction_Records.xlsx")
     cases = pd.read_excel("Dataset/Case_Creation_Details.xlsx")
-    return iso, cases
+    thr = pd.read_excel("Dataset/Transaction_Hit_Rules.xlsx")
+    return iso, cases, thr
 
 
 def create_label(iso, cases):
@@ -289,10 +290,51 @@ def get_feature_columns(df):
     return [c for c in df.columns if c not in exclude]
 
 
+def add_rule_features(df, thr):
+    """Add rule-hit features from Transaction_Hit_Rules.
+
+    Join via DE037 (retrieval reference number). Features:
+    - rule_hit_count: total rules that fired for this transaction
+    - rule_hit_cc_count: CC (post-auth case creation) rules
+    - rule_hit_rad_count: RAD (real-time auth) rules
+    - max_rule_score: maximum TOT_SCR from rule hits
+    """
+    df = df.copy()
+    df["DE037"] = df["DE037"].astype(str).str.strip()
+
+    # Aggregate rule hits per DE037
+    thr = thr.copy()
+    thr["_de037"] = thr["DE037"].astype(str).str.strip()
+    thr["_rule_typ"] = thr["RULE_TYP"].astype(str).str.strip()
+    thr["_tot_scr"] = pd.to_numeric(thr["TOT_SCR"], errors="coerce").fillna(0)
+
+    # Total rule count per transaction
+    rule_counts = thr.groupby("_de037").size().rename("rule_hit_count")
+    cc_counts = thr[thr["_rule_typ"] == "CC"].groupby("_de037").size().rename("rule_hit_cc_count")
+    rad_counts = thr[thr["_rule_typ"] == "RAD"].groupby("_de037").size().rename("rule_hit_rad_count")
+    max_score = thr.groupby("_de037")["_tot_scr"].max().rename("max_rule_score")
+    distinct_rules = thr.groupby("_de037")["RULE_ID"].nunique().rename("distinct_rule_count")
+
+    for feat in [rule_counts, cc_counts, rad_counts, max_score, distinct_rules]:
+        df = df.merge(feat, left_on="DE037", right_index=True, how="left")
+
+    for c in ["rule_hit_count", "rule_hit_cc_count", "rule_hit_rad_count",
+              "max_rule_score", "distinct_rule_count"]:
+        df[c] = df[c].fillna(0)
+
+    # Binary: did any rule fire?
+    df["any_rule_hit"] = (df["rule_hit_count"] > 0).astype(int)
+
+    return df
+
+
 def prepare():
-    iso, cases = load_data()
+    iso, cases, thr = load_data()
     iso = create_label(iso, cases)
     df = engineer_features(iso)
+
+    # Add rule-hit features
+    df = add_rule_features(df, thr)
 
     # Time-based split
     df = df.sort_values("cre_tms").reset_index(drop=True)
