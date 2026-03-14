@@ -325,6 +325,13 @@ def add_rule_features(df, thr):
     # Binary: did any rule fire?
     df["any_rule_hit"] = (df["rule_hit_count"] > 0).astype(int)
 
+    # Top rule IDs as binary features
+    thr["_rule_id"] = thr["RULE_ID"].astype(str).str.strip()
+    top_rules = ["NOT1", "TA003", "N001", "C8", "NOT2", "TA004", "000LJW", "CC0407"]
+    for rule_id in top_rules:
+        rule_txns = set(thr[thr["_rule_id"] == rule_id]["_de037"].values)
+        df[f"rule_{rule_id}"] = df["DE037"].isin(rule_txns).astype(int)
+
     return df
 
 
