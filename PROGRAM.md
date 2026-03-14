@@ -18,7 +18,7 @@ Once you get confirmation, kick off the experimentation.
 ## Be creative on the solution
 1. no need to force yourself to create a binary model (fraud / non-fraud)
 2. it could be fraud / likely-fraud / non-fraud
-3. although you should avoid data-leakage, but if you found that some feature in the rules are useful for you to create the model, use it.
+3. STRICTLY AVOID DATA LEAKAGE, DO NOT USE ANY RULE BASED FEATURE DIRECTLY! instead, understand what type of rule that a case got triggered. For example a rule with > 1000 transactions in a min, use this as part of the feature engineering instead.
 4. you can also come out with a solution that combine both rule based features and hand crafted features.
 
 ## Experimentation
