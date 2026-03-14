@@ -17,14 +17,6 @@ def train():
      train_case_nos, test_case_nos,
      confirmed_fraud, confirmed_nf) = result
 
-    # Split training into train (85%) + calibration (15%) for threshold tuning
-    cal_size = int(len(X_train) * 0.15)
-    cal_idx = len(X_train) - cal_size
-    X_tr = X_train[:cal_idx]
-    y_tr = y_train[:cal_idx]
-    X_cal = X_train[cal_idx:]
-    y_cal = y_train[cal_idx:]
-
     model = xgb.XGBClassifier(
         n_estimators=1500,
         max_depth=7,
@@ -42,21 +34,12 @@ def train():
     )
 
     train_start = time.time()
-    model.fit(X_tr, y_tr)
+    model.fit(X_train, y_train)
     training_seconds = time.time() - train_start
 
-    # === Standard binary evaluation ===
-    cal_proba = model.predict_proba(X_cal)[:, 1]
-    best_thresh = 0.5
-    best_cal_f1 = 0
-    for t in np.arange(0.05, 0.95, 0.01):
-        score = f1_score(y_cal, (cal_proba >= t).astype(int), zero_division=0)
-        if score > best_cal_f1:
-            best_cal_f1 = score
-            best_thresh = t
-
+    # === Standard binary evaluation (fixed threshold) ===
     y_proba_test = model.predict_proba(X_test)[:, 1]
-    y_pred = (y_proba_test >= best_thresh).astype(int)
+    y_pred = (y_proba_test >= 0.5).astype(int)
 
     f1 = f1_score(y_test, y_pred, zero_division=0)
     precision = precision_score(y_test, y_pred, zero_division=0)
