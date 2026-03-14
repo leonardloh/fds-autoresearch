@@ -5,38 +5,66 @@ import numpy as np
 def load_data():
     iso = pd.read_excel("Dataset/ISO8583_Transaction_Records.xlsx")
     cases = pd.read_excel("Dataset/Case_Creation_Details.xlsx")
-    thr = pd.read_excel("Dataset/Transaction_Hit_Rules.xlsx")
-    return iso, cases, thr
+    cuh = pd.read_excel("Dataset/Case_Update_History.xlsx")
+    return iso, cases, cuh
 
 
-def create_label(iso, cases):
+def create_label(iso, cases, cuh):
     """Label: fraud=1 if transaction has a valid CASE_NO (flagged for investigation).
 
-    Using all cased transactions as positive class (4415 txns) since
-    confirmed-only (70 txns) is too few for temporal evaluation.
+    Clean labels using Case_Update_History:
+    - Status 750 = confirmed non-fraud (analyst reviewed, normal transaction)
+    - These cases are flipped to fraud=0.
     """
     iso = iso.copy()
     case_no_int = pd.to_numeric(
         iso["CASE_NO"].astype(str).str.strip(), errors="coerce"
     ).fillna(0).astype(int)
     iso["fraud"] = (case_no_int > 0).astype(int)
+
+    # Clean labels: remove confirmed non-fraud (status 750) from positives
+    after = cuh[cuh["B4_AFTER_IND"].astype(str).str.strip() == "A"]
+    after_sorted = after.sort_values("CRE_TMS")
+    last_per_case = after_sorted.groupby("CASE_NO").last()
+    cleared_cases = set(
+        last_per_case[last_per_case["CASE_STATUS"] == 750].index.values
+    )
+    if cleared_cases:
+        iso.loc[
+            iso["fraud"] == 1,
+            "fraud"
+        ] = iso.loc[iso["fraud"] == 1, "CASE_NO"].apply(
+            lambda x: 0 if int(
+                pd.to_numeric(str(x).strip(), errors="coerce") or 0
+            ) in cleared_cases else 1
+        )
+
     return iso
 
 
 def engineer_features(df):
-    """Engineer basic features that don't require train-only computation.
+    """Engineer features from raw transaction attributes.
 
-    Response code and auth status REMOVED (leakage: they encode fraud system output).
-    Categorical dummies are NOT created here -- done after split to prevent leakage.
+    No rule-based system outputs used (removed: all rule hit features).
+    No settlement/billing amounts (DE005/DE006 may not be available at auth time).
+    Features are inspired by what fraud detection rules check for.
     """
     df = df.copy()
 
     # === Amount features ===
     df["amount"] = df["DE004"].fillna(0).astype(float)
     df["log_amount"] = np.log1p(df["amount"])
+    # Amount threshold features (inspired by RAD rules checking amount thresholds)
+    df["amount_gte_1000"] = (df["amount"] >= 1000).astype(int)
+    df["amount_gte_5000"] = (df["amount"] >= 5000).astype(int)
+    df["amount_gte_250"] = (df["amount"] >= 250).astype(int)
 
     # === MCC ===
     df["mcc"] = df["DE018"].fillna(0).astype(int)
+    # High-risk MCC flags (inspired by RAD rules targeting specific MCCs)
+    df["mcc_6011"] = (df["mcc"] == 6011).astype(int)  # ATM/cash
+    df["mcc_5411"] = (df["mcc"] == 5411).astype(int)  # grocery/supermarket
+    df["mcc_5999"] = (df["mcc"] == 5999).astype(int)  # misc retail
 
     # === Card-present flags (pre-authorization attributes) ===
     df["is_emv"] = (df["EMV_STAT"].astype(str).str.strip() == "Y").astype(int)
@@ -44,6 +72,9 @@ def engineer_features(df):
     df["is_chip"] = (df["CHIP_STAT"].astype(str).str.strip() == "Y").astype(int)
     df["is_fallback"] = (df["FALLBCK_FLG"].astype(str).str.strip() == "Y").astype(int)
     df["is_ecom"] = (df["ECOM_3D_FLG"].astype(str).str.strip() == "Y").astype(int)
+    # Magstripe detection (inspired by TSRAD13: magstripe transaction rule)
+    pos_entry = df["DE022"].astype(str).str.strip()
+    df["is_magstripe"] = pos_entry.isin(["90", "02"]).astype(int)
 
     # === CVC2 ===
     df["cvc2_match"] = (df["CVC2_FLG"].astype(str).str.strip() == "M").astype(int)
@@ -66,6 +97,8 @@ def engineer_features(df):
     df["eci_nonsecure"] = (eci_str == "008").astype(int)
     df["eci_recurring"] = (eci_str == "002").astype(int)
     df["eci_moto"] = eci_str.isin(["001", "004"]).astype(int)
+    # Non-3DS flag (inspired by RAD rules: XYZRAD1A, XYZRAD1B, RAD01)
+    df["is_non_3ds"] = ((df["eci_authenticated"] == 0) & (df["is_ecom"] == 0)).astype(int)
 
     # === Payment network ===
     usr_str = df["USR_ID"].astype(str).str.strip()
@@ -75,12 +108,6 @@ def engineer_features(df):
     # === Misc flags ===
     df["is_non_fiat"] = (df["NON_FIAT_IND"].astype(str).str.strip() == "Y").astype(int)
     df["is_daf"] = (df["DAF_IND"].astype(str).str.strip() == "Y").astype(int)
-
-    # === Settlement / billing amount features ===
-    df["settle_amount"] = df["DE005"].fillna(0).astype(float)
-    df["billing_amount"] = df["DE006"].fillna(0).astype(float)
-    df["amount_billing_diff"] = df["amount"] - df["billing_amount"]
-    df["amount_billing_ratio"] = df["amount"] / (df["billing_amount"] + 1)
 
     # === Timestamp for temporal operations ===
     df["cre_tms"] = pd.to_numeric(df["CRE_TMS"], errors="coerce").fillna(0)
@@ -124,8 +151,11 @@ def compute_velocity_features(df):
     df["card_txn_count_1h"] = 0.0
     df["card_txn_count_24h"] = 0.0
     df["card_txn_sum_24h"] = 0.0
+    df["card_txn_count_10min"] = 0.0
+    df["card_txn_sum_10min"] = 0.0
 
     one_hour = 10000000  # CRE_TMS format: YYYYMMDDHHMMSSmmm
+    ten_minutes = 1000000
     twenty_four_hours = 240000000
 
     # Sort by card + time for velocity computation, but track original position
@@ -143,6 +173,8 @@ def compute_velocity_features(df):
         cnt_1h = np.zeros(n)
         cnt_24h = np.zeros(n)
         sum_24h = np.zeros(n)
+        cnt_10m = np.zeros(n)
+        sum_10m = np.zeros(n)
 
         for i in range(n):
             t = times[i]
@@ -154,11 +186,16 @@ def compute_velocity_features(df):
                 sum_24h[i] += amounts[j]
                 if diff <= one_hour:
                     cnt_1h[i] += 1
+                if diff <= ten_minutes:
+                    cnt_10m[i] += 1
+                    sum_10m[i] += amounts[j]
 
         for k, idx in enumerate(idxs):
             df.at[idx, "card_txn_count_1h"] = cnt_1h[k]
             df.at[idx, "card_txn_count_24h"] = cnt_24h[k]
             df.at[idx, "card_txn_sum_24h"] = sum_24h[k]
+            df.at[idx, "card_txn_count_10min"] = cnt_10m[k]
+            df.at[idx, "card_txn_sum_10min"] = sum_10m[k]
 
     # Restore original order
     df = df.sort_values("_orig_pos").drop(columns=["_orig_pos"])
@@ -268,6 +305,7 @@ def compute_aggregation_features(df, train_df):
     df["amount_x_card_risk"] = df["amount"] * df["card_risk"]
     df["log_amount_x_mcc_risk"] = df["log_amount"] * df["mcc_risk"]
     df["velocity_x_amount"] = df["card_txn_count_24h"] * df["log_amount"]
+    df["velocity_10m_x_amount"] = df["card_txn_count_10min"] * df["log_amount"]
 
     return df
 
@@ -290,61 +328,10 @@ def get_feature_columns(df):
     return [c for c in df.columns if c not in exclude]
 
 
-def add_rule_features(df, thr):
-    """Add rule-hit features from Transaction_Hit_Rules.
-
-    Join via DE037 (retrieval reference number). Features:
-    - rule_hit_count: total rules that fired for this transaction
-    - rule_hit_cc_count: CC (post-auth case creation) rules
-    - rule_hit_rad_count: RAD (real-time auth) rules
-    - max_rule_score: maximum TOT_SCR from rule hits
-    """
-    df = df.copy()
-    df["DE037"] = df["DE037"].astype(str).str.strip()
-
-    # Aggregate rule hits per DE037
-    thr = thr.copy()
-    thr["_de037"] = thr["DE037"].astype(str).str.strip()
-    thr["_rule_typ"] = thr["RULE_TYP"].astype(str).str.strip()
-    thr["_tot_scr"] = pd.to_numeric(thr["TOT_SCR"], errors="coerce").fillna(0)
-
-    # Total rule count per transaction
-    rule_counts = thr.groupby("_de037").size().rename("rule_hit_count")
-    cc_counts = thr[thr["_rule_typ"] == "CC"].groupby("_de037").size().rename("rule_hit_cc_count")
-    rad_counts = thr[thr["_rule_typ"] == "RAD"].groupby("_de037").size().rename("rule_hit_rad_count")
-    max_score = thr.groupby("_de037")["_tot_scr"].max().rename("max_rule_score")
-    distinct_rules = thr.groupby("_de037")["RULE_ID"].nunique().rename("distinct_rule_count")
-
-    for feat in [rule_counts, cc_counts, rad_counts, max_score, distinct_rules]:
-        df = df.merge(feat, left_on="DE037", right_index=True, how="left")
-
-    for c in ["rule_hit_count", "rule_hit_cc_count", "rule_hit_rad_count",
-              "max_rule_score", "distinct_rule_count"]:
-        df[c] = df[c].fillna(0)
-
-    # Binary: did any rule fire?
-    df["any_rule_hit"] = (df["rule_hit_count"] > 0).astype(int)
-
-    # All rule IDs as binary features
-    thr["_rule_id"] = thr["RULE_ID"].astype(str).str.strip()
-    all_rules = thr["_rule_id"].unique()
-    # Build rule->set(DE037) mapping for efficiency
-    rule_txn_sets = {}
-    for rule_id in all_rules:
-        rule_txn_sets[rule_id] = set(thr[thr["_rule_id"] == rule_id]["_de037"].values)
-    for rule_id in sorted(all_rules):
-        df[f"rule_{rule_id}"] = df["DE037"].isin(rule_txn_sets[rule_id]).astype(int)
-
-    return df
-
-
 def prepare():
-    iso, cases, thr = load_data()
-    iso = create_label(iso, cases)
+    iso, cases, cuh = load_data()
+    iso = create_label(iso, cases, cuh)
     df = engineer_features(iso)
-
-    # Add rule-hit features
-    df = add_rule_features(df, thr)
 
     # Time-based split
     df = df.sort_values("cre_tms").reset_index(drop=True)
