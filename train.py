@@ -11,7 +11,7 @@ def train():
 
     X_train, X_test, y_train, y_test, feature_cols = prepare()
 
-    # Class weight for imbalanced data
+    # Class weight
     n_neg = (y_train == 0).sum()
     n_pos = max((y_train == 1).sum(), 1)
     scale_pos_weight = n_neg / n_pos
@@ -30,28 +30,34 @@ def train():
     model.fit(X_train, y_train)
     training_seconds = time.time() - train_start
 
-    # Threshold tuning via temporal CV on training data (not test set)
+    # Threshold tuning: train once per CV fold, sweep thresholds on predictions
     best_thresh = 0.5
     if y_train.sum() >= 5:
         tscv = TimeSeriesSplit(n_splits=3)
-        best_cv_f1 = 0
-        for t in np.arange(0.05, 0.95, 0.01):
-            cv_scores = []
-            for tr_idx, val_idx in tscv.split(X_train):
-                if y_train[tr_idx].sum() == 0:
-                    continue
-                m = xgb.XGBClassifier(
-                    n_estimators=200, max_depth=6, learning_rate=0.1,
-                    scale_pos_weight=scale_pos_weight, eval_metric="logloss",
-                    random_state=42, n_jobs=-1,
-                )
-                m.fit(X_train[tr_idx], y_train[tr_idx])
-                p = m.predict_proba(X_train[val_idx])[:, 1]
-                cv_scores.append(f1_score(y_train[val_idx], (p >= t).astype(int), zero_division=0))
-            if cv_scores:
-                mean_f1 = np.mean(cv_scores)
-                if mean_f1 > best_cv_f1:
-                    best_cv_f1 = mean_f1
+        fold_probas = []
+        fold_labels = []
+        for tr_idx, val_idx in tscv.split(X_train):
+            if y_train[tr_idx].sum() == 0:
+                continue
+            fold_neg = (y_train[tr_idx] == 0).sum()
+            fold_pos = max((y_train[tr_idx] == 1).sum(), 1)
+            m = xgb.XGBClassifier(
+                n_estimators=200, max_depth=6, learning_rate=0.1,
+                scale_pos_weight=fold_neg / fold_pos,
+                eval_metric="logloss", random_state=42, n_jobs=-1,
+            )
+            m.fit(X_train[tr_idx], y_train[tr_idx])
+            fold_probas.append(m.predict_proba(X_train[val_idx])[:, 1])
+            fold_labels.append(y_train[val_idx])
+
+        if fold_probas:
+            all_probas = np.concatenate(fold_probas)
+            all_labels = np.concatenate(fold_labels)
+            best_cv_f1 = 0
+            for t in np.arange(0.05, 0.95, 0.01):
+                score = f1_score(all_labels, (all_probas >= t).astype(int), zero_division=0)
+                if score > best_cv_f1:
+                    best_cv_f1 = score
                     best_thresh = t
 
     y_proba = model.predict_proba(X_test)[:, 1]
