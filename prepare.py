@@ -138,7 +138,7 @@ def add_dummies(df, train_df):
 
 
 def compute_velocity_features(df):
-    """Compute per-card velocity features over the full timeline.
+    """Compute per-card velocity and behavioral features over the full timeline.
 
     Preserves the original dataframe index/order. Only looks backward in time
     (no future leakage). Data must already be sorted by cre_tms.
@@ -153,6 +153,9 @@ def compute_velocity_features(df):
     df["card_txn_sum_24h"] = 0.0
     df["card_txn_count_10min"] = 0.0
     df["card_txn_sum_10min"] = 0.0
+    df["card_max_amt_24h"] = 0.0
+    df["time_since_last_txn"] = 0.0
+    df["is_first_txn"] = 1.0
 
     one_hour = 10000000  # CRE_TMS format: YYYYMMDDHHMMSSmmm
     ten_minutes = 1000000
@@ -162,12 +165,21 @@ def compute_velocity_features(df):
     df["_orig_pos"] = np.arange(len(df))
     df = df.sort_values([card_col, "cre_tms"])
 
+    # Also track merchant diversity and new merchant per card
+    merch_col = df["MMER_ID"].astype(str).str.strip().values
+    mcc_col = df["mcc"].values
+    df["new_merchant"] = 0.0
+    df["distinct_merch_24h"] = 0.0
+    df["distinct_mcc_24h"] = 0.0
+
     for card_id in df[card_col].unique():
         mask = df[card_col] == card_id
         card_df = df.loc[mask]
         idxs = card_df.index.tolist()
         times = card_df["cre_tms"].values
         amounts = card_df["amount"].values
+        # Get positional indices for merch/mcc arrays
+        pos_indices = card_df["_orig_pos"].values.astype(int)
         n = len(times)
 
         cnt_1h = np.zeros(n)
@@ -175,20 +187,50 @@ def compute_velocity_features(df):
         sum_24h = np.zeros(n)
         cnt_10m = np.zeros(n)
         sum_10m = np.zeros(n)
+        max_amt_24h = np.zeros(n)
+        time_since = np.zeros(n)
+        is_first = np.ones(n)
+        new_merch = np.zeros(n)
+        dist_merch = np.zeros(n)
+        dist_mcc = np.zeros(n)
 
+        seen_merchants = set()
         for i in range(n):
             t = times[i]
+            cur_merch = merch_col[pos_indices[i]]
+            cur_mcc = mcc_col[pos_indices[i]]
+
+            # New merchant flag
+            if cur_merch not in seen_merchants:
+                new_merch[i] = 1.0
+            seen_merchants.add(cur_merch)
+
+            # Time since last
+            if i > 0:
+                is_first[i] = 0.0
+                time_since[i] = t - times[i - 1]
+
+            # Window-based features
+            merch_set_24h = set()
+            mcc_set_24h = set()
             for j in range(i - 1, -1, -1):
                 diff = t - times[j]
                 if diff > twenty_four_hours:
                     break
                 cnt_24h[i] += 1
                 sum_24h[i] += amounts[j]
+                if amounts[j] > max_amt_24h[i]:
+                    max_amt_24h[i] = amounts[j]
+                merch_set_24h.add(merch_col[pos_indices[j]])
+                mcc_set_24h.add(mcc_col[pos_indices[j]])
                 if diff <= one_hour:
                     cnt_1h[i] += 1
                 if diff <= ten_minutes:
                     cnt_10m[i] += 1
                     sum_10m[i] += amounts[j]
+
+            dist_merch[i] = len(merch_set_24h)
+            dist_mcc[i] = len(mcc_set_24h)
 
         for k, idx in enumerate(idxs):
             df.at[idx, "card_txn_count_1h"] = cnt_1h[k]
@@ -196,6 +238,12 @@ def compute_velocity_features(df):
             df.at[idx, "card_txn_sum_24h"] = sum_24h[k]
             df.at[idx, "card_txn_count_10min"] = cnt_10m[k]
             df.at[idx, "card_txn_sum_10min"] = sum_10m[k]
+            df.at[idx, "card_max_amt_24h"] = max_amt_24h[k]
+            df.at[idx, "time_since_last_txn"] = time_since[k]
+            df.at[idx, "is_first_txn"] = is_first[k]
+            df.at[idx, "new_merchant"] = new_merch[k]
+            df.at[idx, "distinct_merch_24h"] = dist_merch[k]
+            df.at[idx, "distinct_mcc_24h"] = dist_mcc[k]
 
     # Restore original order
     df = df.sort_values("_orig_pos").drop(columns=["_orig_pos"])
