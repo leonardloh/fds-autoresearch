@@ -109,30 +109,34 @@ def add_dummies(df, train_df):
     return df
 
 
-def compute_velocity_features(full_df, target_indices):
+def compute_velocity_features(df):
     """Compute per-card velocity features over the full timeline.
 
-    full_df: the complete time-sorted data (train + test concatenated)
-    target_indices: boolean mask for which rows to return velocity for
+    Preserves the original dataframe index/order. Only looks backward in time
+    (no future leakage). Data must already be sorted by cre_tms.
     """
-    full_df = full_df.copy()
+    df = df.copy()
     card_col = "REF_CRD_NO"
-
-    full_df = full_df.sort_values([card_col, "cre_tms"]).reset_index(drop=True)
+    orig_index = df.index.copy()
 
     # Initialize velocity columns
-    full_df["card_txn_count_1h"] = 0.0
-    full_df["card_txn_count_24h"] = 0.0
-    full_df["card_txn_sum_24h"] = 0.0
+    df["card_txn_count_1h"] = 0.0
+    df["card_txn_count_24h"] = 0.0
+    df["card_txn_sum_24h"] = 0.0
 
     one_hour = 10000000  # CRE_TMS format: YYYYMMDDHHMMSSmmm
     twenty_four_hours = 240000000
 
-    for card_id in full_df[card_col].unique():
-        mask = full_df[card_col] == card_id
-        idxs = full_df.index[mask].tolist()
-        times = full_df.loc[mask, "cre_tms"].values
-        amounts = full_df.loc[mask, "amount"].values
+    # Sort by card + time for velocity computation, but track original position
+    df["_orig_pos"] = np.arange(len(df))
+    df = df.sort_values([card_col, "cre_tms"])
+
+    for card_id in df[card_col].unique():
+        mask = df[card_col] == card_id
+        card_df = df.loc[mask]
+        idxs = card_df.index.tolist()
+        times = card_df["cre_tms"].values
+        amounts = card_df["amount"].values
         n = len(times)
 
         cnt_1h = np.zeros(n)
@@ -151,11 +155,15 @@ def compute_velocity_features(full_df, target_indices):
                     cnt_1h[i] += 1
 
         for k, idx in enumerate(idxs):
-            full_df.at[idx, "card_txn_count_1h"] = cnt_1h[k]
-            full_df.at[idx, "card_txn_count_24h"] = cnt_24h[k]
-            full_df.at[idx, "card_txn_sum_24h"] = sum_24h[k]
+            df.at[idx, "card_txn_count_1h"] = cnt_1h[k]
+            df.at[idx, "card_txn_count_24h"] = cnt_24h[k]
+            df.at[idx, "card_txn_sum_24h"] = sum_24h[k]
 
-    return full_df
+    # Restore original order
+    df = df.sort_values("_orig_pos").drop(columns=["_orig_pos"])
+    df.index = orig_index
+
+    return df
 
 
 def compute_aggregation_features(df, train_df):
@@ -260,7 +268,8 @@ def prepare():
     split_idx = int(len(df) * 0.8)
 
     # Compute velocity on full timeline (so test sees training history)
-    df = compute_velocity_features(df, None)
+    # df is already sorted by cre_tms; velocity preserves this order
+    df = compute_velocity_features(df)
 
     train_df = df.iloc[:split_idx].copy()
     test_df = df.iloc[split_idx:].copy()

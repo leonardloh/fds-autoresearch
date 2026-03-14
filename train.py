@@ -11,15 +11,18 @@ def train():
 
     X_train, X_test, y_train, y_test, feature_cols = prepare()
 
-    # Class weight
+    # Class weight -- use sqrt to reduce noise amplification with noisy labels
     n_neg = (y_train == 0).sum()
     n_pos = max((y_train == 1).sum(), 1)
-    scale_pos_weight = n_neg / n_pos
+    scale_pos_weight = np.sqrt(n_neg / n_pos)
 
     model = xgb.XGBClassifier(
-        n_estimators=200,
-        max_depth=6,
+        n_estimators=300,
+        max_depth=4,
         learning_rate=0.1,
+        min_child_weight=5,
+        subsample=0.8,
+        colsample_bytree=0.8,
         scale_pos_weight=scale_pos_weight,
         eval_metric="logloss",
         random_state=42,
@@ -42,8 +45,9 @@ def train():
             fold_neg = (y_train[tr_idx] == 0).sum()
             fold_pos = max((y_train[tr_idx] == 1).sum(), 1)
             m = xgb.XGBClassifier(
-                n_estimators=200, max_depth=6, learning_rate=0.1,
-                scale_pos_weight=fold_neg / fold_pos,
+                n_estimators=300, max_depth=4, learning_rate=0.1,
+                min_child_weight=5, subsample=0.8, colsample_bytree=0.8,
+                scale_pos_weight=np.sqrt(fold_neg / fold_pos),
                 eval_metric="logloss", random_state=42, n_jobs=-1,
             )
             m.fit(X_train[tr_idx], y_train[tr_idx])
