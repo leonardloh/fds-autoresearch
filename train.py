@@ -26,9 +26,9 @@ def train():
     y_cal = y_train[cal_idx:]
 
     model = xgb.XGBClassifier(
-        n_estimators=800,
-        max_depth=4,
-        learning_rate=0.08,
+        n_estimators=1000,
+        max_depth=5,
+        learning_rate=0.05,
         min_child_weight=3,
         subsample=0.85,
         colsample_bytree=0.6,
